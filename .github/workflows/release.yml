@@ -20,22 +20,39 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Skip if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release v${{ steps.version.outputs.version }} already exists (likely published by local make release); skipping CI build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Update Info.plist version
+        if: steps.check.outputs.skip != 'true'
         run: |
           BUILD_NUM=$(git rev-list --count HEAD)
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" Info.plist
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" Info.plist
 
       - name: Resolve dependencies
+        if: steps.check.outputs.skip != 'true'
         run: swift package resolve
 
       - name: Build release
+        if: steps.check.outputs.skip != 'true'
         run: swift build -c release
 
       - name: Generate icon
+        if: steps.check.outputs.skip != 'true'
         run: test -f AppIcon.icns || swift scripts/generate-icon.swift
 
       - name: Bundle app
+        if: steps.check.outputs.skip != 'true'
         run: |
           APP=HomeBar.app
           mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources" "${APP}/Contents/Frameworks"
@@ -47,6 +64,7 @@ jobs:
           cp -R .build/arm64-apple-macosx/release/Sparkle.framework "${APP}/Contents/Frameworks/"
 
       - name: Create DMG
+        if: steps.check.outputs.skip != 'true'
         run: |
           mkdir -p dmg_staging
           cp -R HomeBar.app dmg_staging/
@@ -56,6 +74,7 @@ jobs:
 
       - name: Sign DMG
         id: sign
+        if: steps.check.outputs.skip != 'true'
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
@@ -81,6 +100,7 @@ jobs:
           echo "Length: ${LENGTH}"
 
       - name: Generate appcast
+        if: steps.check.outputs.skip != 'true'
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           BUILD_NUM=$(git rev-list --count HEAD)
@@ -112,6 +132,7 @@ jobs:
           EOF
 
       - name: Commit appcast
+        if: steps.check.outputs.skip != 'true'
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
@@ -120,6 +141,7 @@ jobs:
           git push origin HEAD:main || true
 
       - name: Create GitHub Release
+        if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -132,4 +154,5 @@ jobs:
           Existing installations will be notified of this update automatically."
 
       - name: Run tests
+        if: steps.check.outputs.skip != 'true'
         run: swift test
