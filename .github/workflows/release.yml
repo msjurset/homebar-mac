@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Info.plist version
+        run: |
+          BUILD_NUM=$(git rev-list --count HEAD)
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" Info.plist
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Build release
+        run: swift build -c release
+
+      - name: Generate icon
+        run: test -f AppIcon.icns || swift scripts/generate-icon.swift
+
+      - name: Bundle app
+        run: |
+          APP=HomeBar.app
+          mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources" "${APP}/Contents/Frameworks"
+          cp .build/release/HomeBar "${APP}/Contents/MacOS/HomeBar"
+          install_name_tool -add_rpath @loader_path/../Frameworks "${APP}/Contents/MacOS/HomeBar" 2>/dev/null || true
+          cp Info.plist "${APP}/Contents/Info.plist"
+          cp AppIcon.icns "${APP}/Contents/Resources/AppIcon.icns"
+          test -d Resources && cp -R Resources/. "${APP}/Contents/Resources/" || true
+          cp -R .build/arm64-apple-macosx/release/Sparkle.framework "${APP}/Contents/Frameworks/"
+
+      - name: Create DMG
+        run: |
+          mkdir -p dmg_staging
+          cp -R HomeBar.app dmg_staging/
+          ln -sf /Applications dmg_staging/Applications
+          hdiutil create -volname HomeBar -srcfolder dmg_staging -ov -format UDZO "HomeBar-${{ steps.version.outputs.version }}.dmg"
+          rm -rf dmg_staging
+
+      - name: Sign DMG
+        id: sign
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          SIGN_TOOL=".build/artifacts/sparkle/Sparkle/bin/sign_update"
+          DMG="HomeBar-${{ steps.version.outputs.version }}.dmg"
+
+          # Write private key to temp file for sign_update
+          KEY_FILE=$(mktemp)
+          echo -n "${SPARKLE_PRIVATE_KEY}" > "${KEY_FILE}"
+
+          SIGN_OUTPUT=$("${SIGN_TOOL}" "${DMG}" --ed-key-file "${KEY_FILE}" 2>&1)
+          rm -f "${KEY_FILE}"
+
+          SIGNATURE=$(echo "${SIGN_OUTPUT}" | grep -oE 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="\(.*\)"/\1/')
+          if [ -z "${SIGNATURE}" ]; then
+            SIGNATURE=$(echo "${SIGN_OUTPUT}" | grep -oE '[A-Za-z0-9+/=]{40,}' | head -1)
+          fi
+          LENGTH=$(stat -f%z "${DMG}")
+
+          echo "signature=${SIGNATURE}" >> "$GITHUB_OUTPUT"
+          echo "length=${LENGTH}" >> "$GITHUB_OUTPUT"
+          echo "Signature: ${SIGNATURE}"
+          echo "Length: ${LENGTH}"
+
+      - name: Generate appcast
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BUILD_NUM=$(git rev-list --count HEAD)
+          PUBDATE=$(date -u "+%a, %d %b %Y %H:%M:%S +0000")
+          DMG_URL="https://github.com/msjurset/homebar-mac/releases/download/v${VERSION}/HomeBar-${VERSION}.dmg"
+
+          cat > appcast.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <channel>
+              <title>HomeBar</title>
+              <link>https://github.com/msjurset/homebar-mac</link>
+              <description>HomeBar app updates</description>
+              <language>en</language>
+              <item>
+                <title>Version ${VERSION}</title>
+                <sparkle:version>${BUILD_NUM}</sparkle:version>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+                <pubDate>${PUBDATE}</pubDate>
+                <enclosure
+                  url="${DMG_URL}"
+                  length="${{ steps.sign.outputs.length }}"
+                  type="application/octet-stream"
+                  sparkle:edSignature="${{ steps.sign.outputs.signature }}" />
+              </item>
+            </channel>
+          </rss>
+          EOF
+
+      - name: Commit appcast
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add appcast.xml Info.plist
+          git commit -m "Update appcast for v${{ steps.version.outputs.version }}" || true
+          git push origin HEAD:main || true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "v${VERSION}" "HomeBar-${VERSION}.dmg" \
+            --title "HomeBar v${VERSION}" \
+            --notes "## HomeBar v${VERSION}
+
+          Download the DMG, open it, and drag HomeBar to Applications.
+          Existing installations will be notified of this update automatically."
+
+      - name: Run tests
+        run: swift test

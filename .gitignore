@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+HomeBar.app/
+HomeBar-*.dmg
+dmg_staging/
+*.xcodeproj/
+.DS_Store
