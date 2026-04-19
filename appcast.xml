@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>HomeBar</title>
+    <link>https://github.com/msjurset/homebar-mac</link>
+    <description>HomeBar app updates</description>
+    <language>en</language>
+    <item>
+      <title>Version 0.1.0</title>
+      <sparkle:version>2</sparkle:version>
+      <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 19 Apr 2026 01:25:04 +0000</pubDate>
+      <enclosure
+        url="https://github.com/msjurset/homebar-mac/releases/download/v0.1.0/HomeBar-0.1.0.dmg"
+        length="2892904"
+        type="application/octet-stream"
+        sparkle:edSignature="3fEjG0IhIVT56zZ36u3p3BjNnjQmLF95FG9WV9j2D2eZiap7jQgA6RhMtnT+b8JoZLf8o7H/ciKFCvLaDkJMBA==" />
+    </item>
+  </channel>
+</rss>
