@@ -103,6 +103,7 @@ enum HomeBarMain {
     /// LSUIElement apps don't get a default Edit menu, which breaks ⌘C/⌘V/⌘A
     /// in any hosted SwiftUI text field. Install a minimal Edit-only menu so
     /// the responder chain routes those shortcuts.
+    @MainActor
     private static func installMinimalMainMenu() {
         let main = NSMenu()
 
