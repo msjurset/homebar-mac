@@ -6,16 +6,16 @@
     <description>HomeBar app updates</description>
     <language>en</language>
     <item>
-      <title>Version 0.1.1</title>
-      <sparkle:version>4</sparkle:version>
-      <sparkle:shortVersionString>0.1.1</sparkle:shortVersionString>
+      <title>Version 0.1.2</title>
+      <sparkle:version>5</sparkle:version>
+      <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
-      <pubDate>Sun, 19 Apr 2026 01:50:00 +0000</pubDate>
+      <pubDate>Thu, 23 Apr 2026 01:37:38 +0000</pubDate>
       <enclosure
-        url="https://github.com/msjurset/homebar-mac/releases/download/v0.1.1/HomeBar-0.1.1.dmg"
-        length="2999849"
+        url="https://github.com/msjurset/homebar-mac/releases/download/v0.1.2/HomeBar-0.1.2.dmg"
+        length="3027432"
         type="application/octet-stream"
-        sparkle:edSignature="cbQWg6ii77hKbnFX9EtK7pOEe/ch81yXjhTBBLxP4NUnPPb54B0rfo0uc9ZA5T0UuLglljT52fNju5p16D+VDQ==" />
+        sparkle:edSignature="VkRPgBu1c0J76PIiY32OZ/5RjL1vosrwkiCyBgnrpi1PNmTEM+o2naD9BdmWEoqmDxSi9jBAGzQtgZJmMep2Dg==" />
     </item>
   </channel>
 </rss>
