@@ -28,6 +28,11 @@ final class HomeBarStore {
     var status: ConnectionStatus = .disconnected
     var entities: [HAEntity] = []
     var areas: [HAArea] = []
+    /// Resolved entity_id → area_id mapping. Built from the HA entity
+    /// registry and device registry, since `area_id` typically lives on the
+    /// device (or the entity-registry override) rather than in the entity's
+    /// state attributes. Populated on connect and refreshed by reconcile.
+    var entityAreaIDs: [String: String] = [:]
     var pinnedIDs: [String] = []
     var aliases: [String: String] = [:]
     var recents: [String] = []
@@ -48,6 +53,14 @@ final class HomeBarStore {
     /// True while the Option key is held, used by tiles to toggle an
     /// "expanded" presentation (e.g. media_player transport overlay).
     var optionHeld: Bool = false
+    /// True while the search field's suggestions dropdown is visible. The
+    /// global navigation monitor defers arrow/enter/escape to the field while
+    /// this is set so the dropdown can own those keys.
+    var searchSuggestionsVisible: Bool = false
+    /// Mirror of whether the popover's search field has any text. Lets the
+    /// global escape monitor defer to the search field's own clear-on-escape
+    /// handler instead of closing the panel.
+    var searchFieldHasText: Bool = false
     /// Maps automation entity_id (e.g. "automation.office_toggle") to the list
     /// of entities referenced in its config. Populated asynchronously after
     /// connect; used to render aggregate tile color for automations.
@@ -58,12 +71,43 @@ final class HomeBarStore {
 
     private var hasLoaded = false
     private var eventTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+    private var dropWatchTask: Task<Void, Never>?
+    private var reconcileTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectAttempt: Int = 0
+    private var wakeObserver: NSObjectProtocol?
     private var entityIndex: [String: Int] = [:]
+    /// Cadence of the periodic reconcile that re-fetches `get_states` to catch
+    /// silently-dead subscriptions (socket alive, but HA stopped delivering
+    /// `state_changed` events on its side).
+    nonisolated static let reconcileInterval: TimeInterval = 60
+    /// Hard timeout for a single reconcile request. Prevents a wedged
+    /// socket from leaving `reconcileInFlight` stuck and starving future
+    /// reconciles.
+    nonisolated static let reconcileTimeout: TimeInterval = 8
+
+    /// Exponential-ish reconnect backoff in seconds. Capped by re-using the
+    /// last value on further attempts.
+    nonisolated static let reconnectDelays: [Double] = [1, 2, 5, 15, 30]
+
+    nonisolated static func reconnectDelay(forAttempt attempt: Int) -> Double {
+        let capped = max(0, min(attempt, reconnectDelays.count - 1))
+        return reconnectDelays[capped]
+    }
 
     var areaName: [String: String] {
         var m: [String: String] = [:]
         for a in areas { m[a.areaID] = a.name }
         return m
+    }
+
+    /// Resolves an entity's area_id, checking state attributes first (rare
+    /// but authoritative when present) and falling back to the entity/device
+    /// registry mapping.
+    func resolvedAreaID(for entity: HAEntity) -> String? {
+        if let direct = entity.areaID { return direct }
+        return entityAreaIDs[entity.entityID]
     }
 
     func bootstrap() async {
@@ -141,25 +185,267 @@ final class HomeBarStore {
             try await client.connect(websocketURL: wsURL, token: token)
             let loaded = try await client.getStates()
             let loadedAreas = (try? await client.getAreas()) ?? []
+            let loadedEntityAreas = await Self.loadEntityAreaMap(client: client)
             entities = loaded.sorted { $0.friendlyName.localizedCaseInsensitiveCompare($1.friendlyName) == .orderedAscending }
             rebuildEntityIndex()
             areas = loadedAreas
+            entityAreaIDs = loadedEntityAreas
             status = .connected
+            reconnectAttempt = 0
             try await client.subscribeStateChanges()
             try? await client.subscribePersistentNotifications()
             try? await client.subscribeHomebarSpeak()
             startEventLoop()
+            startHeartbeat()
+            startDropWatcher()
+            startReconcileLoop()
+            registerWakeObserver()
             Task { await refreshAutomationAffects() }
         } catch {
             status = .failed(error.localizedDescription)
+            if Self.isRetriableConnectError(error) {
+                scheduleReconnect()
+            }
         }
     }
 
     func disconnect() async {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        dropWatchTask?.cancel()
+        dropWatchTask = nil
+        reconcileTask?.cancel()
+        reconcileTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        unregisterWakeObserver()
         eventTask?.cancel()
         eventTask = nil
         await client.disconnect()
         status = .disconnected
+        reconnectAttempt = 0
+    }
+
+    /// Builds the entity_id → area_id map by combining the entity registry
+    /// (which has entity-level area override and a device link) with the
+    /// device registry (which has the device's area). Entity-level area
+    /// wins; otherwise falls back to the device's area.
+    private static func loadEntityAreaMap(client: HAClient) async -> [String: String] {
+        async let entityRegTask: [HAClient.EntityRegistryEntry] = (try? await client.getEntityRegistry()) ?? []
+        async let deviceMapTask: [String: String] = (try? await client.getDeviceAreaMap()) ?? [:]
+        let entityReg = await entityRegTask
+        let deviceMap = await deviceMapTask
+        var resolved: [String: String] = [:]
+        for entry in entityReg {
+            if let aid = entry.areaID {
+                resolved[entry.entityID] = aid
+            } else if let did = entry.deviceID, let dAid = deviceMap[did] {
+                resolved[entry.entityID] = dAid
+            }
+        }
+        return resolved
+    }
+
+    // MARK: Reconnect / heartbeat
+
+    private func startHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                guard self.status == .connected else { continue }
+                do {
+                    try await self.pingWithTimeout(seconds: 10)
+                } catch {
+                    await self.handleUnexpectedDisconnect()
+                    return
+                }
+            }
+        }
+    }
+
+    private func pingWithTimeout(seconds: Double) async throws {
+        let client = self.client
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await client.ping() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw HAClientError.notConnected
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+
+    /// Runs `reconcileNow()` every `reconcileInterval` seconds while connected.
+    /// Catches "alive socket, dead subscription" — HA can stop delivering
+    /// `state_changed` events without breaking the WebSocket; the heartbeat
+    /// ping still succeeds, but tiles drift stale. The reconcile re-fetches
+    /// the full snapshot and applies it, and surfaces a wedged socket as a
+    /// thrown error that triggers the existing reconnect path.
+    private func startReconcileLoop() {
+        reconcileTask?.cancel()
+        reconcileTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let interval = HomeBarStore.reconcileInterval
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                guard self.status == .connected else { continue }
+                await self.reconcileNow()
+            }
+        }
+    }
+
+    /// Fetches a fresh `get_states` snapshot and replaces the entity list.
+    /// Triggers reconnect on failure. Safe to call from the UI (e.g.
+    /// popover-open) — debounced internally so back-to-back calls don't
+    /// double up.
+    private var reconcileInFlight: Bool = false
+    func reconcileNow() async {
+        guard status == .connected, !reconcileInFlight else { return }
+        reconcileInFlight = true
+        defer { reconcileInFlight = false }
+        do {
+            let fresh = try await Self.runWithTimeout(seconds: Self.reconcileTimeout) { [client] in
+                try await client.getStates()
+            }
+            entities = fresh.sorted {
+                $0.friendlyName.localizedCaseInsensitiveCompare($1.friendlyName) == .orderedAscending
+            }
+            rebuildEntityIndex()
+            // Refresh areas too. If `connect()` raced or the registry call
+            // failed silently (try?), this is the recovery path — without
+            // it, `area:` autocomplete stays empty until a full reconnect.
+            if let freshAreas = try? await client.getAreas(), !freshAreas.isEmpty {
+                areas = freshAreas
+            }
+            // Same idea for the entity-area resolver — refresh on every
+            // reconcile so newly-assigned areas in HA become filterable
+            // without forcing a reconnect here.
+            let freshMap = await Self.loadEntityAreaMap(client: client)
+            if !freshMap.isEmpty {
+                entityAreaIDs = freshMap
+            }
+        } catch {
+            await handleUnexpectedDisconnect()
+        }
+    }
+
+    /// Schedules a one-shot reconcile shortly after a user-initiated action.
+    /// Confirms state sync even when the `state_changed` event lags behind
+    /// the call_service round trip.
+    private func scheduleQuickReconcile() {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            await self?.reconcileNow()
+        }
+    }
+
+    /// Races `body` against a timer; throws `HAClientError.notConnected` if
+    /// the body doesn't return within `seconds`. Used to keep a wedged
+    /// socket from indefinitely blocking the reconcile in-flight flag.
+    private static func runWithTimeout<T: Sendable>(
+        seconds: TimeInterval,
+        body: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw HAClientError.notConnected
+            }
+            guard let result = try await group.next() else {
+                throw HAClientError.notConnected
+            }
+            group.cancelAll()
+            return result
+        }
+    }
+
+    private func startDropWatcher() {
+        dropWatchTask?.cancel()
+        let client = self.client
+        dropWatchTask = Task { [weak self] in
+            let stream = client.unexpectedDisconnectStream
+            for await _ in stream {
+                guard !Task.isCancelled, let self else { return }
+                await self.handleUnexpectedDisconnect()
+                return
+            }
+        }
+    }
+
+    private func handleUnexpectedDisconnect() async {
+        heartbeatTask?.cancel(); heartbeatTask = nil
+        dropWatchTask?.cancel(); dropWatchTask = nil
+        reconcileTask?.cancel(); reconcileTask = nil
+        eventTask?.cancel(); eventTask = nil
+        await client.disconnect()
+        status = .disconnected
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        reconnectTask?.cancel()
+        let attempt = reconnectAttempt
+        reconnectAttempt += 1
+        let delay = Self.reconnectDelay(forAttempt: attempt)
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            await self.connect()
+        }
+    }
+
+    nonisolated static func isRetriableConnectError(_ error: Error) -> Bool {
+        if let ha = error as? HAClientError {
+            switch ha {
+            case .invalidURL, .authFailed:
+                return false
+            case .notConnected, .protocolError, .serverError:
+                return true
+            }
+        }
+        return true
+    }
+
+    private func registerWakeObserver() {
+        guard wakeObserver == nil else { return }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.onWake()
+            }
+        }
+    }
+
+    private func unregisterWakeObserver() {
+        if let obs = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            wakeObserver = nil
+        }
+    }
+
+    private func onWake() {
+        reconnectAttempt = 0
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        Task { [weak self] in
+            guard let self else { return }
+            if self.status == .connected {
+                do {
+                    try await self.pingWithTimeout(seconds: 5)
+                } catch {
+                    await self.handleUnexpectedDisconnect()
+                }
+            } else {
+                await self.connect()
+            }
+        }
     }
 
     // MARK: Live state updates
@@ -289,6 +575,20 @@ final class HomeBarStore {
         pinnedIDs.contains(entityID)
     }
 
+    /// Reorders pinned entities by dropping `sourceID` onto `targetID`. The
+    /// dragged item is placed at the target's slot; anything after it shifts
+    /// down. No-op if either id isn't pinned or source == target. Persists.
+    func movePinned(_ sourceID: String, before targetID: String) {
+        guard sourceID != targetID,
+              let sourceIdx = pinnedIDs.firstIndex(of: sourceID),
+              let targetIdx = pinnedIDs.firstIndex(of: targetID) else { return }
+        pinnedIDs.remove(at: sourceIdx)
+        let insertIdx = sourceIdx < targetIdx ? targetIdx - 1 : targetIdx
+        pinnedIDs.insert(sourceID, at: insertIdx)
+        let snapshot = pinnedIDs
+        Task { try? await persistence.savePins(snapshot) }
+    }
+
     func togglePin(_ entity: HAEntity) {
         if let idx = pinnedIDs.firstIndex(of: entity.entityID) {
             pinnedIDs.remove(at: idx)
@@ -307,7 +607,9 @@ final class HomeBarStore {
     // MARK: Usage tracking (recent / frequent)
 
     private static let recentCap = 30
-    private static let displayCap = 10
+    /// How many recents/frequents to surface initially. Callers can render
+    /// more by slicing further — the store-side lists are uncapped.
+    static let initialRecencyDisplay = 10
 
     func recordUsage(_ entityID: String) {
         // Any successful user-initiated action clears a lingering "Failed:"
@@ -326,20 +628,26 @@ final class HomeBarStore {
             try? await persistence.saveRecents(r)
             try? await persistence.saveUsageCounts(c)
         }
+
+        // The state_changed event from HA usually arrives milliseconds after
+        // the call_service success, but if the subscription is sluggish or
+        // half-dead, this safety-net reconcile catches the divergence
+        // without waiting for the next periodic tick.
+        scheduleQuickReconcile()
     }
 
-    /// Non-pinned entities in order of recent use.
+    /// Non-pinned entities in order of recent use. Uncapped — the popover
+    /// chooses how many to render.
     var recentEntities: [HAEntity] {
         let byID = Dictionary(uniqueKeysWithValues: entities.map { ($0.entityID, $0) })
         let pinnedSet = Set(pinnedIDs)
         return recents
             .compactMap { byID[$0] }
             .filter { !pinnedSet.contains($0.entityID) }
-            .prefix(Self.displayCap)
-            .map { $0 }
     }
 
-    /// Non-pinned entities ordered by total fire count desc.
+    /// Non-pinned entities ordered by total fire count desc. Uncapped — the
+    /// popover chooses how many to render.
     var frequentEntities: [HAEntity] {
         let byID = Dictionary(uniqueKeysWithValues: entities.map { ($0.entityID, $0) })
         let pinnedSet = Set(pinnedIDs)
@@ -347,8 +655,6 @@ final class HomeBarStore {
             .sorted { $0.value > $1.value }
             .compactMap { byID[$0.key] }
             .filter { !pinnedSet.contains($0.entityID) }
-            .prefix(Self.displayCap)
-            .map { $0 }
     }
 
     // MARK: Aliases (local rename — not pushed to HA)
@@ -584,12 +890,12 @@ final class HomeBarStore {
 
     /// States we treat as "nominal" — anything else on a watched entity is an
     /// alert. Covers the common passive states across domains.
-    private static let nominalStates: Set<String> = [
+    nonisolated private static let nominalStates: Set<String> = [
         "off", "closed", "locked", "home", "safe", "disarmed",
         "docked", "stopped", "idle", "ok"
     ]
 
-    static func isWatchAlert(_ entity: HAEntity) -> Bool {
+    nonisolated static func isWatchAlert(_ entity: HAEntity) -> Bool {
         !nominalStates.contains(entity.state)
     }
 

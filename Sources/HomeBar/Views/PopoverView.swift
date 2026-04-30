@@ -4,7 +4,9 @@ import AppKit
 struct PopoverView: View {
     @Environment(HomeBarStore.self) private var store
     @State private var query: String = ""
-    @FocusState private var searchFocused: Bool
+    @State private var cursor: Int = 0
+    @State private var pendingCursor: Int?
+    @State private var wantsSearchFocus: Bool = false
     @AppStorage("homebar.gridMode") private var gridMode: Bool = false
     @AppStorage("homebar.showFrequent") private var showFrequent: Bool = false
     /// Our own estimate of what's at the top of the ScrollView viewport.
@@ -12,6 +14,32 @@ struct PopoverView: View {
     /// perfectly accurate if the user trackpad-scrolls manually, which is
     /// acceptable for a keyboard-driven popover.
     @State private var topVisibleID: String?
+    @State private var statusCopied: Bool = false
+    @State private var statusCopiedTask: Task<Void, Never>?
+
+    /// Frozen list of suggestion strings for the current typing session. Tab /
+    /// arrows cycle through this list without recomputing; typing resets it.
+    @State private var suggestionItems: [String] = []
+    /// UTF-16 range in `query` that the next suggestion pick will replace.
+    /// Updated after each preview so successive Tabs replace the last preview.
+    @State private var suggestionReplaceRange: NSRange = .init(location: 0, length: 0)
+    @State private var suggestionAddTrailingSpace: Bool = false
+    /// Index of the currently highlighted item in `suggestionItems`. Tab /
+    /// Arrow advance this without touching the field text; Enter commits it.
+    @State private var suggestionIndex: Int = 0
+    /// Set during acceptCurrentSuggestion so the query/cursor onChange
+    /// handlers skip their recompute — the programmatic mutation has its own
+    /// follow-up recompute that knows whether to chain into values or keys.
+    @State private var isProgrammaticEdit: Bool = false
+    /// Entity_id of the tile a drag is currently hovering over. Drives the
+    /// budge offset on adjacent tiles and the insertion line on the target.
+    @State private var dragOverID: String?
+    /// How many recents/frequents to render. The list grows in increments of
+    /// 10 when the user scrolls to the bottom sentinel.
+    @State private var recencyLimit: Int = HomeBarStore.initialRecencyDisplay
+    /// True while the brief delay before bumping `recencyLimit` is in flight,
+    /// so the spinner has a moment to be visible during the lazy load.
+    @State private var isLoadingMoreRecency: Bool = false
 
     private func openSettings() {
         AppController.shared.openSettings()
@@ -29,21 +57,31 @@ struct PopoverView: View {
         .onAppear {
             focusSoon()
             refreshHotkeyMap()
+            Task { await store.reconcileNow() }
         }
-        .onChange(of: query) { _, _ in refreshDisplayed() }
+        .onChange(of: query) { _, _ in
+            recencyLimit = HomeBarStore.initialRecencyDisplay
+            refreshDisplayed()
+        }
         .onChange(of: store.pinnedIDs) { _, _ in refreshDisplayed() }
         .onChange(of: store.recents) { _, _ in refreshDisplayed() }
-        .onChange(of: showFrequent) { _, _ in refreshDisplayed() }
+        .onChange(of: showFrequent) { _, _ in
+            recencyLimit = HomeBarStore.initialRecencyDisplay
+            refreshDisplayed()
+        }
         .onChange(of: gridMode) { _, _ in refreshDisplayed() }
+        .onChange(of: recencyLimit) { _, _ in refreshDisplayed() }
         .onReceive(NotificationCenter.default.publisher(for: .homebarPanelDidOpen)) { _ in
+            recencyLimit = HomeBarStore.initialRecencyDisplay
             focusSoon()
             refreshHotkeyMap()
+            Task { await store.reconcileNow() }
         }
     }
 
     private func focusSoon() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            searchFocused = true
+            wantsSearchFocus = true
         }
     }
 
@@ -54,12 +92,42 @@ struct PopoverView: View {
             Text("HomeBar")
                 .font(.headline)
             Spacer()
-            Text(store.status.label)
+            statusLabel
+        }
+        .padding(12)
+    }
+
+    @ViewBuilder
+    private var statusLabel: some View {
+        let labelText = statusCopied ? "Copied" : store.status.label
+        if case .failed(let msg) = store.status {
+            Button(action: { copyStatus(msg) }) {
+                Text(labelText)
+                    .font(.caption)
+                    .foregroundStyle(Color.orange)
+                    .lineLimit(1)
+                    .underline(true, pattern: .dot)
+            }
+            .buttonStyle(.plain)
+            .help("Click to copy error")
+        } else {
+            Text(labelText)
                 .font(.caption)
                 .foregroundStyle(store.status == .connected ? Color.secondary : Color.orange)
                 .lineLimit(1)
         }
-        .padding(12)
+    }
+
+    private func copyStatus(_ message: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message, forType: .string)
+        statusCopied = true
+        statusCopiedTask?.cancel()
+        statusCopiedTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            statusCopied = false
+        }
     }
 
     @ViewBuilder
@@ -92,12 +160,21 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 0) {
             searchField
             Divider()
-            if query.isEmpty {
-                defaultSections
-            } else if filteredEntities.isEmpty {
-                emptyResult
-            } else {
-                resultsList
+            ZStack(alignment: .topLeading) {
+                Group {
+                    if query.isEmpty {
+                        defaultSections
+                    } else if filteredEntities.isEmpty {
+                        emptyResult
+                    } else {
+                        resultsList
+                    }
+                }
+                if store.searchSuggestionsVisible {
+                    suggestionsDropdown
+                        .padding(.leading, 26)
+                        .padding(.top, 4)
+                }
             }
         }
     }
@@ -105,8 +182,9 @@ struct PopoverView: View {
     @ViewBuilder
     private var defaultSections: some View {
         let pinned = store.pinnedEntities
-        let recency = showFrequent ? store.frequentEntities : store.recentEntities
-        if pinned.isEmpty && recency.isEmpty {
+        let recencyAll = showFrequent ? store.frequentEntities : store.recentEntities
+        let recencyShown = Array(recencyAll.prefix(recencyLimit))
+        if pinned.isEmpty && recencyAll.isEmpty {
             emptyResult
         } else {
             ScrollViewReader { proxy in
@@ -115,19 +193,33 @@ struct PopoverView: View {
                         if !pinned.isEmpty {
                             sectionHeader(title: "FAVORITES", trailing: AnyView(viewModeToggle))
                             if gridMode {
-                                grid(entities: pinned)
+                                grid(entities: pinned, reorderable: true)
                             } else {
-                                list(entities: pinned)
+                                list(entities: pinned, reorderable: true)
                             }
                         }
-                        if !recency.isEmpty {
+                        if !recencyShown.isEmpty {
                             sectionHeader(
                                 title: showFrequent ? "FREQUENT" : "RECENT",
                                 trailing: AnyView(recencyToggle)
                             )
-                            list(entities: recency)
+                            list(entities: recencyShown)
+                            // Always render the sentinel so reaching the
+                            // end-of-list flashes a spinner regardless of
+                            // whether more items can be loaded — that's the
+                            // visual confirmation the user expects.
+                            lazyLoadSentinel
                         }
                     }
+                }
+                .onScrollGeometryChange(for: Bool.self) { geometry in
+                    // True only when the content is actually scrollable AND
+                    // the user has scrolled close to the bottom edge.
+                    let scrollable = geometry.contentSize.height > geometry.containerSize.height + 1
+                    let bottomEdge = geometry.contentOffset.y + geometry.containerSize.height
+                    return scrollable && bottomEdge >= geometry.contentSize.height - 40
+                } action: { _, nearBottom in
+                    if nearBottom { loadMoreRecency() }
                 }
                 .onChange(of: store.selectedEntityID) { _, id in
                     scrollToSelected(id, proxy: proxy)
@@ -228,23 +320,279 @@ struct PopoverView: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-            TextField("Search \(store.entities.count) entities…", text: $query)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .focused($searchFocused)
+            FilterField(
+                text: $query,
+                placeholder: "Search \(store.entities.count) entities…",
+                font: .systemFont(ofSize: 12),
+                pendingCursor: $pendingCursor,
+                onCursorChange: { cursor = $0 },
+                onKey: handleSearchKey,
+                onSubmit: submitSearch,
+                wantsFocus: wantsSearchFocus
+            )
+            .frame(height: 18)
             if !query.isEmpty {
-                Button(action: { query = "" }) {
+                Button(action: clearSearch) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
                 .help("Clear search")
-                .keyboardShortcut(.escape, modifiers: [])
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
+        .onChange(of: query) { _, _ in
+            store.searchFieldHasText = !query.isEmpty
+            if isProgrammaticEdit { return }
+            recomputeSuggestions()
+        }
+        .onChange(of: cursor) { _, _ in
+            if isProgrammaticEdit { return }
+            recomputeSuggestions()
+        }
+    }
+
+    private var suggestionsDropdown: some View {
+        ScrollViewReader { proxy in
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(suggestionItems.enumerated()), id: \.offset) { idx, item in
+                        Text(item)
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .fill(idx == suggestionIndex ? Color.accentColor.opacity(0.22) : Color.clear)
+                            )
+                            .contentShape(Rectangle())
+                            .id(idx)
+                            .onTapGesture {
+                                suggestionIndex = idx
+                                acceptCurrentSuggestion()
+                            }
+                    }
+                }
+            }
+            .onChange(of: suggestionIndex) { _, idx in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    proxy.scrollTo(idx, anchor: .center)
+                }
+            }
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .shadow(radius: 8, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.black.opacity(0.15), lineWidth: 0.5)
+        )
+        .frame(width: 220)
+        .frame(maxHeight: 220, alignment: .top)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func clearSearch() {
+        query = ""
+        pendingCursor = 0
+        dismissSuggestions()
+    }
+
+    private func recomputeSuggestions() {
+        // Use the text OUTSIDE the current word to gather already-used tokens
+        // so the word being edited doesn't hide its own suggestions.
+        let ns = query as NSString
+        let clampedCursor = max(0, min(cursor, ns.length))
+        // Probe with the real domain/area context so value-completion paths
+        // (`domain:`, `area:`) survive the engine's `guard !values.isEmpty`
+        // check when partial is empty. Otherwise we'd dismiss before ever
+        // computing real suggestions.
+        let domains = store.entities.map { $0.domain }
+        let areaNames = store.areas.map { $0.name }
+        let ctxProbe = SearchSuggestion.Context(
+            input: query,
+            cursor: clampedCursor,
+            domains: domains,
+            areaNames: areaNames,
+            alreadyUsedTokens: []
+        )
+        guard let probe = SearchSuggestion.compute(ctxProbe) else {
+            dismissSuggestions()
+            return
+        }
+        let wordRange = probe.replaceRange
+        let before = ns.substring(to: wordRange.location) as String
+        let after = ns.substring(from: wordRange.location + wordRange.length) as String
+        let otherTokens = SearchQuery.parse(before + " " + after).tokens
+
+        let ctx = SearchSuggestion.Context(
+            input: query,
+            cursor: clampedCursor,
+            domains: domains,
+            areaNames: areaNames,
+            alreadyUsedTokens: otherTokens
+        )
+        guard let result = SearchSuggestion.compute(ctx), !result.suggestions.isEmpty else {
+            dismissSuggestions()
+            return
+        }
+        suggestionItems = result.suggestions
+        suggestionReplaceRange = result.replaceRange
+        suggestionAddTrailingSpace = result.addTrailingSpace
+        suggestionIndex = 0
+        store.searchSuggestionsVisible = true
+    }
+
+    private func dismissSuggestions() {
+        suggestionItems = []
+        suggestionIndex = 0
+        store.searchSuggestionsVisible = false
+    }
+
+    private func handleSearchKey(_ key: FilterFieldKey) -> Bool {
+        switch key {
+        case .tab, .arrowDown, .ctrlJ:
+            if !store.searchSuggestionsVisible {
+                recomputeSuggestions()
+                return true
+            }
+            // Single-item list on Tab: fill it in (no trailing space, no
+            // dismiss) so the user can keep typing or commit with Enter.
+            if suggestionItems.count == 1 {
+                performTabAutocomplete()
+                return true
+            }
+            advanceHighlight(by: 1)
+            return true
+        case .backTab, .arrowUp, .ctrlK:
+            if !store.searchSuggestionsVisible {
+                recomputeSuggestions()
+                return true
+            }
+            if suggestionItems.count == 1 {
+                performTabAutocomplete()
+                return true
+            }
+            advanceHighlight(by: -1)
+            return true
+        case .enter:
+            guard store.searchSuggestionsVisible, !suggestionItems.isEmpty else { return false }
+            acceptCurrentSuggestion()
+            return true
+        case .escape:
+            if store.searchSuggestionsVisible {
+                dismissSuggestions()
+                return true
+            }
+            if !query.isEmpty {
+                clearSearch()
+                return true
+            }
+            return false
+        }
+    }
+
+    private func advanceHighlight(by delta: Int) {
+        let count = suggestionItems.count
+        guard count > 0 else { return }
+        suggestionIndex = (suggestionIndex + delta + count) % count
+    }
+
+    /// Insert the single highlighted suggestion into the field *without*
+    /// committing (no trailing space, no dismiss). Used when Tab lands on a
+    /// 1-item list so the user can keep typing or press Enter to finalize.
+    private func performTabAutocomplete() {
+        let idx = max(0, suggestionIndex)
+        guard idx < suggestionItems.count else { return }
+        let rawSuggestion = suggestionItems[idx]
+        let ns = query as NSString
+        let loc = suggestionReplaceRange.location
+        let len = suggestionReplaceRange.length
+        guard loc + len <= ns.length else { return }
+        let before = ns.substring(with: NSRange(location: 0, length: loc)) as String
+        let after = ns.substring(with: NSRange(location: loc + len, length: ns.length - loc - len)) as String
+        let newCursor = (before as NSString).length + (rawSuggestion as NSString).length
+        isProgrammaticEdit = true
+        query = before + rawSuggestion + after
+        cursor = newCursor
+        pendingCursor = newCursor
+        DispatchQueue.main.async {
+            isProgrammaticEdit = false
+            // Reopen dropdown in its new phase (key → values, or the same
+            // single value if nothing else matches).
+            recomputeSuggestions()
+        }
+    }
+
+    private func acceptCurrentSuggestion() {
+        let idx = suggestionIndex >= 0 ? suggestionIndex : 0
+        guard idx < suggestionItems.count else { return }
+        let rawSuggestion = suggestionItems[idx]
+        let suggestion = rawSuggestion + (suggestionAddTrailingSpace ? " " : "")
+        let ns = query as NSString
+        let loc = suggestionReplaceRange.location
+        let len = suggestionReplaceRange.length
+        guard loc + len <= ns.length else { return }
+        let before = ns.substring(with: NSRange(location: 0, length: loc)) as String
+        let after = ns.substring(with: NSRange(location: loc + len, length: ns.length - loc - len)) as String
+        let newCursor = (before as NSString).length + (suggestion as NSString).length
+        let wasKeyCompletion = !suggestionAddTrailingSpace && rawSuggestion.hasSuffix(":")
+        isProgrammaticEdit = true
+        query = before + suggestion + after
+        cursor = newCursor
+        pendingCursor = newCursor
+        dismissSuggestions()
+        DispatchQueue.main.async {
+            isProgrammaticEdit = false
+            // Accepting a key like "is:" is only halfway to a real filter;
+            // immediately reopen the dropdown with value suggestions.
+            if wasKeyCompletion { recomputeSuggestions() }
+        }
+    }
+
+    private func submitSearch() {
+        // Plain Enter with no suggestions falls through to the app-level nav
+        // monitor which fires the selected tile. Nothing to do here.
+    }
+
+    /// Visual-only footer for the recents/frequents list — renders a
+    /// spinner while a lazy load is in flight, otherwise stays invisible.
+    /// The actual load trigger lives on the parent ScrollView's
+    /// `onScrollGeometryChange` so it only fires from real user scrolling.
+    private var lazyLoadSentinel: some View {
+        HStack {
+            Spacer()
+            ProgressView()
+                .controlSize(.small)
+                .opacity(isLoadingMoreRecency ? 1 : 0)
+            Spacer()
+        }
+        .frame(height: 24)
+    }
+
+    private func loadMoreRecency() {
+        guard !isLoadingMoreRecency else { return }
+        isLoadingMoreRecency = true
+        let totalAvailable = (showFrequent ? store.frequentEntities : store.recentEntities).count
+        Task { @MainActor in
+            // Brief flash of the spinner whether or not there's more to load.
+            // The user wants the visual confirmation either way; if we're at
+            // the true end, the spinner just blinks and disappears.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if recencyLimit < totalAvailable {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    recencyLimit += 10
+                }
+            }
+            isLoadingMoreRecency = false
+        }
     }
 
     private var emptyResult: some View {
@@ -263,13 +611,14 @@ struct PopoverView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func list(entities: [HAEntity]) -> some View {
+    private func list(entities: [HAEntity], reorderable: Bool = false) -> some View {
         LazyVStack(alignment: .leading, spacing: 2) {
             ForEach(entities) { entity in
+                tileWithReorder(entity: entity, reorderable: reorderable, axis: .vertical) {
                 EntityTile(
                     entity: entity,
                     displayName: store.displayName(for: entity),
-                    areaName: entity.areaID.flatMap { store.areaName[$0] },
+                    areaName: store.resolvedAreaID(for: entity).flatMap { store.areaName[$0] },
                     isPinned: store.isPinned(entity.entityID),
                     hasAlias: store.aliases[entity.entityID] != nil,
                     hotkey: hotkey(for: entity.entityID),
@@ -291,6 +640,7 @@ struct PopoverView: View {
                         Task { await store.unjoinMediaPlayer(entityID: memberID) }
                     }
                 )
+                }
                 .id(entity.entityID)
             }
         }
@@ -298,11 +648,124 @@ struct PopoverView: View {
         .padding(.vertical, 4)
     }
 
+    /// Wraps a tile with drag-and-drop affordances when `reorderable` is true.
+    /// The dragged payload is the entity_id; on drop we reorder the pinned
+    /// list so the dragged tile takes the target's slot. No-op when not
+    /// reorderable so the same renderer works for search/recents too.
+    ///
+    /// While a drag hovers a target, the target and the tile immediately
+    /// before it (in `pinnedIDs`) budge apart by ~8pt and an accent-colored
+    /// insertion line appears between them. `axis` chooses whether the budge
+    /// is vertical (list mode) or horizontal (grid mode).
+    ///
+    /// Slidable tiles can't use whole-tile `.draggable` because their inner
+    /// `DragGesture` consumes the drag. For those, the drag source is a
+    /// small grip handle overlay; the rest of the tile keeps its slider.
+    @ViewBuilder
+    private func tileWithReorder<Content: View>(
+        entity: HAEntity,
+        reorderable: Bool,
+        axis: Axis,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        if reorderable {
+            let isSlider = HomeBarStore.isSlidable(entity)
+            content()
+                .offset(reorderOffset(for: entity.entityID, axis: axis))
+                .overlay(alignment: axis == .vertical ? .top : .leading) {
+                    if dragOverID == entity.entityID {
+                        insertionLine(axis: axis)
+                    }
+                }
+                .overlay(alignment: .top) {
+                    if isSlider {
+                        reorderGripHandle(for: entity.entityID)
+                            .offset(y: -2)
+                    }
+                }
+                .animation(.easeOut(duration: 0.12), value: dragOverID)
+                .modifier(WholeTileDraggable(id: entity.entityID, enabled: !isSlider))
+                .dropDestination(for: String.self) { items, _ in
+                    defer { dragOverID = nil }
+                    guard let sourceID = items.first else { return false }
+                    store.movePinned(sourceID, before: entity.entityID)
+                    return true
+                } isTargeted: { targeted in
+                    if targeted {
+                        dragOverID = entity.entityID
+                    } else if dragOverID == entity.entityID {
+                        dragOverID = nil
+                    }
+                }
+        } else {
+            content()
+        }
+    }
+
+    /// Small visible grip the user drags to reorder slidable tiles. The slider
+    /// gesture sits on the icon area below; the grip is the only `.draggable`
+    /// source so the two never fight over the same drag.
+    private func reorderGripHandle(for entityID: String) -> some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.system(size: 7, weight: .bold))
+            .foregroundStyle(Color.secondary.opacity(0.65))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(Color.black.opacity(0.18))
+            )
+            .draggable(entityID)
+            .onHover { inside in
+                if inside { NSCursor.openHand.set() } else { NSCursor.arrow.set() }
+            }
+            .help("Drag to reorder")
+    }
+
+    /// How much to nudge a tile when a drag is hovering over a neighbor. The
+    /// drop target shifts forward (down/right) by half the gap; the tile
+    /// immediately before it in the pinned order shifts backward by the
+    /// other half. Together they open a visible gap centered on the
+    /// insertion line.
+    private func reorderOffset(for entityID: String, axis: Axis) -> CGSize {
+        let half: CGFloat = 4
+        guard let target = dragOverID else { return .zero }
+        if entityID == target {
+            return axis == .vertical
+                ? CGSize(width: 0, height: half)
+                : CGSize(width: half, height: 0)
+        }
+        guard let targetIdx = store.pinnedIDs.firstIndex(of: target),
+              targetIdx > 0,
+              store.pinnedIDs[targetIdx - 1] == entityID else { return .zero }
+        return axis == .vertical
+            ? CGSize(width: 0, height: -half)
+            : CGSize(width: -half, height: 0)
+    }
+
+    @ViewBuilder
+    private func insertionLine(axis: Axis) -> some View {
+        switch axis {
+        case .vertical:
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(height: 2)
+                .padding(.horizontal, 4)
+                .offset(y: -3)
+        case .horizontal:
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(width: 2)
+                .padding(.vertical, 4)
+                .offset(x: -3)
+        }
+    }
+
     private func otherMediaPlayers(excluding entityID: String) -> [HAEntity] {
         store.entities.filter { $0.domain == "media_player" && $0.entityID != entityID }
     }
 
-    private func grid(entities: [HAEntity]) -> some View {
+    private func grid(entities: [HAEntity], reorderable: Bool = false) -> some View {
         LazyVGrid(columns: [
             GridItem(.flexible(), spacing: 5),
             GridItem(.flexible(), spacing: 5),
@@ -310,6 +773,7 @@ struct PopoverView: View {
             GridItem(.flexible(), spacing: 5),
         ], spacing: 5) {
             ForEach(entities) { entity in
+                tileWithReorder(entity: entity, reorderable: reorderable, axis: .horizontal) {
                 EntityTileCompact(
                     entity: entity,
                     displayName: store.displayName(for: entity),
@@ -334,6 +798,7 @@ struct PopoverView: View {
                         Task { await store.unjoinMediaPlayer(entityID: memberID) }
                     }
                 )
+                }
                 .id(entity.entityID)
             }
         }
@@ -402,19 +867,26 @@ struct PopoverView: View {
     }
 
     private var filteredEntities: [HAEntity] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return [] }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let parsed = SearchQuery.parse(query)
+        guard !parsed.isEmpty else { return [] }
+        let areaNameLookup: [String: String] = store.areaName
         return store.entities.filter { e in
-            e.friendlyName.lowercased().contains(q)
-                || e.entityID.lowercased().contains(q)
-                || (e.areaID.flatMap { store.areaName[$0] }?.lowercased().contains(q) ?? false)
+            parsed.matches(
+                e,
+                areaName: { areaNameLookup[$0] },
+                areaID: { store.resolvedAreaID(for: $0) },
+                isWatched: { store.isWatched($0) }
+            )
         }
     }
 
     private var displayedEntities: [HAEntity] {
         if !query.isEmpty { return filteredEntities }
-        let recency = showFrequent ? store.frequentEntities : store.recentEntities
-        return store.pinnedEntities + recency
+        let recency = (showFrequent ? store.frequentEntities : store.recentEntities)
+            .prefix(recencyLimit)
+        return store.pinnedEntities + Array(recency)
     }
 
     private func hotkey(for entityID: String) -> String? {
@@ -473,5 +945,27 @@ struct PopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+}
+
+/// Conditionally attaches `.draggable(id)` to the whole tile. Used for
+/// non-slidable tiles where there's no inner DragGesture to fight; slidable
+/// tiles instead expose a dedicated grip handle as their drag source.
+///
+/// We deliberately don't switch the cursor on hover here — the whole tile
+/// is the drag surface, so a grab cursor everywhere would feel intrusive
+/// and conflict with the click/tap behavior that's the primary action.
+/// macOS shows its own drag-with-payload cursor once the drag actually
+/// begins, which is enough feedback.
+private struct WholeTileDraggable: ViewModifier {
+    let id: String
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.draggable(id)
+        } else {
+            content
+        }
     }
 }

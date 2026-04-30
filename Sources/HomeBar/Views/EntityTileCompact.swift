@@ -28,6 +28,11 @@ struct EntityTileCompact: View {
     @State private var showRename = false
     @State private var renameText = ""
     @State private var dragIntensity: Double?
+    /// Value the user just dropped to. Kept visible until the HA state_changed
+    /// event catches up (or a short timeout), so the slider doesn't snap back
+    /// to the old cached brightness mid-round-trip.
+    @State private var pendingIntensity: Double?
+    @State private var pendingClearTask: Task<Void, Never>?
     @State private var scrubPreview: Double?
     @State private var showGroupPopover = false
     @State private var showPlayURL = false
@@ -72,7 +77,7 @@ struct EntityTileCompact: View {
     }
 
     private var effectiveIntensity: Double {
-        dragIntensity ?? selfIntensity
+        dragIntensity ?? pendingIntensity ?? selfIntensity
     }
 
     @ViewBuilder
@@ -185,6 +190,14 @@ struct EntityTileCompact: View {
                 NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
             }
         }
+        .onChange(of: selfIntensity) { _, new in
+            guard let pending = pendingIntensity else { return }
+            if abs(new - pending) < 0.02 {
+                pendingIntensity = nil
+                pendingClearTask?.cancel()
+                pendingClearTask = nil
+            }
+        }
     }
 
     private var tooltip: String {
@@ -250,13 +263,25 @@ struct EntityTileCompact: View {
                     .padding(.bottom, 4)
                     .allowsHitTesting(false)
                 if isPinned {
-                    Image(systemName: "pin.fill")
+                    Button(action: onTogglePin) {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 7))
+                            .foregroundStyle(Color.accentColor.opacity(0.9))
+                            .rotationEffect(.degrees(-30))
+                            .padding(4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                    .help("Unpin")
+                }
+                if isWatched {
+                    Image(systemName: "eye.fill")
                         .font(.system(size: 7))
-                        .foregroundStyle(Color.accentColor.opacity(0.9))
-                        .rotationEffect(.degrees(-30))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                        .padding(.trailing, 3)
-                        .padding(.bottom, 3)
+                        .foregroundStyle(HomeBarStore.isWatchAlert(entity) ? Color.orange : Color.secondary.opacity(0.7))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(.leading, 3)
+                        .padding(.top, 3)
                         .allowsHitTesting(false)
                 }
                 if showsTransport {
@@ -409,10 +434,23 @@ struct EntityTileCompact: View {
             }
             .onEnded { _ in
                 if let pct = dragIntensity {
+                    pendingIntensity = pct
                     onSetSliderValue(pct)
+                    schedulePendingIntensityClear()
                 }
                 dragIntensity = nil
             }
+    }
+
+    /// Drop the optimistic pending value after a few seconds in case the HA
+    /// state_changed event never arrives (e.g. command rejected, bulb offline).
+    private func schedulePendingIntensityClear() {
+        pendingClearTask?.cancel()
+        pendingClearTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            pendingIntensity = nil
+        }
     }
 
     @ViewBuilder

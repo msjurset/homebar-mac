@@ -246,7 +246,10 @@ final class AppController {
 
         let buttonFrame = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
         let x = buttonFrame.midX - panel.frame.width / 2
-        let y = buttonFrame.minY - panel.frame.height - 6
+        // 2pt seam between the menu bar bottom and the popover top — enough
+        // to read as a discrete element without re-introducing a noticeable
+        // gap. The rounded corners do most of the visual separation.
+        let y = buttonFrame.minY - panel.frame.height - 2
         panel.setFrameOrigin(NSPoint(x: x, y: y))
         panel.showAnimated()
         installMonitors()
@@ -271,6 +274,12 @@ final class AppController {
         }
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.panel.isVisible, event.keyCode == 53 else { return event }
+            // Defer to the search field when it has something to do with Escape
+            // first: dismiss its suggestions dropdown or clear its text.
+            if self.store.searchSuggestionsVisible { return event }
+            if self.panel.firstResponder is NSText, self.store.searchFieldHasText {
+                return event
+            }
             self.closePanel()
             return nil
         }
@@ -289,6 +298,14 @@ final class AppController {
         }
         navigationMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.panel.isVisible else { return event }
+            // Defer to the search field when its suggestions dropdown owns
+            // arrow / enter / escape.
+            if self.store.searchSuggestionsVisible {
+                switch event.keyCode {
+                case 126, 125, 123, 124, 36, 76, 53: return event
+                default: break
+                }
+            }
             let significantMods: NSEvent.ModifierFlags = [.command, .control, .shift]
             let hasSignificant = !event.modifierFlags.intersection(significantMods).isEmpty
             // In grid mode ↓/↑ move by one row (4 cols); in list mode by 1.

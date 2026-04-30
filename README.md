@@ -6,14 +6,17 @@ A macOS menu bar app for fast Home Assistant control. Raycast-style popover — 
 
 **Search & fire**
 - Pinned favorites, recents, and frequent-use sections
-- Fuzzy search across all entities by name, entity_id, or area
+- Free-text search across name, entity_id, and area, plus structured filters: `is:watched|alerting|on|off`, `domain:<domain>`, `area:<name>`. Tokens AND together with free text.
+- Tab opens an autocomplete dropdown of valid keys/values; arrow keys / Ctrl-J/K cycle, Enter commits. Already-used tokens are excluded from suggestions.
 - Subtle hotkey watermarks on tiles — `⌥1..9` and `⌥A..Z` to fire up to 35 tiles without the mouse
 - Right-click → "Copy Entity ID" (or ⌥-click) for debugging
 
 **Tiles**
 - List and grid (tile) view; your choice persists
+- Drag pinned tiles to reorder them (grid or list)
 - Material Design Icons (MDI): honors HA's per-entity `icon: mdi:...` attribute
 - Local aliases — rename tiles without pushing back to HA (tap to inline-edit or right-click → Rename)
+- Watched tiles show a small eye indicator — orange when alerting, dim when nominal
 - Type label + state + area shown compactly in list view
 
 **Automations**
@@ -30,6 +33,7 @@ A macOS menu bar app for fast Home Assistant control. Raycast-style popover — 
 **Alerts**
 - Right-click any tile → "Watch for Alerts" adds it to the watch set
 - Menu bar icon tints orange when any watched entity is in an off-nominal state (anything other than `off`, `closed`, `locked`, `home`, `safe`, `disarmed`, `docked`, `stopped`, `idle`, `ok`)
+- Watched tiles get a small eye badge; it goes orange when that tile is the one alerting
 - Subscribes to HA's `persistent_notifications_updated` → delivers native macOS banners with a Dismiss action that routes back to `persistent_notification.dismiss`
 
 **Auth**
@@ -128,7 +132,7 @@ Right-click the menu bar icon → **Launch at Login** ✓
 - Swift 6.0, macOS 15+, SPM, zero external Swift dependencies
 - `@main enum HomeBarMain` with `NSApplication.accessory` activation policy (no dock icon)
 - Custom `NSPanel` subclass (`FloatingPanel`) hosting the SwiftUI `PopoverView` via `NSHostingView`
-- `HAClient` actor: URLSessionWebSocketTask for live state + commands, URLSession for REST (automation config fetch)
+- `HAClient` actor: URLSessionWebSocketTask for live state + commands, URLSession for REST (automation config fetch). A 30-second ping heartbeat and an unexpected-disconnect stream drive automatic reconnect with exponential backoff; `NSWorkspace.didWakeNotification` forces an immediate resync after sleep so tiles don't show stale state.
 - `HomeBarStore` — `@Observable @MainActor`, owns entities, pins, aliases, recents, and aggregate computation
 - Resources bundled: MDI font (`materialdesignicons.ttf`) + name→codepoint map (`mdi-map.json`)
 

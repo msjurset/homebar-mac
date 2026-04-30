@@ -26,6 +26,11 @@ struct EntityTile: View {
     @State private var editing = false
     @State private var editText = ""
     @State private var dragIntensity: Double?
+    /// Value the user just dropped to. Held until HA state_changed catches up
+    /// (or a short timeout) so the slider doesn't bounce off the old cached
+    /// brightness.
+    @State private var pendingIntensity: Double?
+    @State private var pendingClearTask: Task<Void, Never>?
     @State private var showGroupPopover = false
     @State private var showPlayURL = false
     @State private var playURLText = ""
@@ -114,7 +119,7 @@ struct EntityTile: View {
     }
 
     private var effectiveIntensity: Double {
-        dragIntensity ?? selfIntensity
+        dragIntensity ?? pendingIntensity ?? selfIntensity
     }
 
     @ViewBuilder
@@ -191,6 +196,14 @@ struct EntityTile: View {
                 NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
             }
         }
+        .onChange(of: selfIntensity) { _, new in
+            guard let pending = pendingIntensity else { return }
+            if abs(new - pending) < 0.02 {
+                pendingIntensity = nil
+                pendingClearTask?.cancel()
+                pendingClearTask = nil
+            }
+        }
     }
 
     private func beginPlayURL() {
@@ -261,6 +274,15 @@ struct EntityTile: View {
                     .padding(.trailing, 3)
                     .padding(.bottom, 2)
                     .help("⌥\(hotkey.uppercased())")
+            }
+            if isWatched {
+                Image(systemName: "eye.fill")
+                    .font(.system(size: 7))
+                    .foregroundStyle(HomeBarStore.isWatchAlert(entity) ? Color.orange : Color.secondary.opacity(0.7))
+                    .frame(width: 34, height: 34, alignment: .topLeading)
+                    .padding(.leading, 3)
+                    .padding(.top, 3)
+                    .help(HomeBarStore.isWatchAlert(entity) ? "Watched — alerting" : "Watched")
             }
         }
     }
@@ -345,7 +367,9 @@ struct EntityTile: View {
                     }
                     .onEnded { _ in
                         if let pct = dragIntensity {
+                            pendingIntensity = pct
                             onSetSliderValue(pct)
+                            schedulePendingIntensityClear()
                         }
                         dragIntensity = nil
                     }
@@ -353,6 +377,15 @@ struct EntityTile: View {
         }
         .frame(height: 3)
         .padding(.top, 3)
+    }
+
+    private func schedulePendingIntensityClear() {
+        pendingClearTask?.cancel()
+        pendingClearTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            pendingIntensity = nil
+        }
     }
 
     private var pinButton: some View {

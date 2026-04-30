@@ -33,18 +33,28 @@ actor HAClient {
     /// Emits every `event` message received after authentication.
     let eventStream: AsyncStream<HAEvent>
 
+    private var dropContinuation: AsyncStream<Void>.Continuation?
+    /// Yields once whenever the socket drops unexpectedly (read error, server
+    /// close). Does NOT yield on explicit `disconnect()` calls. Observers use
+    /// this to trigger a reconnect.
+    let unexpectedDisconnectStream: AsyncStream<Void>
+
     private(set) var isConnected: Bool = false
     private(set) var baseURL: URL?
     private var token: String = ""
     private var restBaseURL: URL?
+    private var intentionalDisconnect: Bool = false
 
     init() {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = false
         self.session = URLSession(configuration: cfg)
-        var cont: AsyncStream<HAEvent>.Continuation!
-        self.eventStream = AsyncStream { cont = $0 }
-        self.eventContinuation = cont
+        var econt: AsyncStream<HAEvent>.Continuation!
+        self.eventStream = AsyncStream { econt = $0 }
+        self.eventContinuation = econt
+        var dcont: AsyncStream<Void>.Continuation!
+        self.unexpectedDisconnectStream = AsyncStream { dcont = $0 }
+        self.dropContinuation = dcont
     }
 
     // MARK: - Connection
@@ -52,6 +62,7 @@ actor HAClient {
     /// Opens the WebSocket, completes the auth handshake, and starts the receive loop.
     func connect(websocketURL: URL, token: String) async throws {
         disconnect()
+        intentionalDisconnect = false
         self.baseURL = websocketURL
         self.token = token
         self.restBaseURL = Self.deriveRestURL(from: websocketURL)
@@ -83,6 +94,7 @@ actor HAClient {
     }
 
     func disconnect() {
+        intentionalDisconnect = true
         receiveTask?.cancel()
         receiveTask = nil
         task?.cancel(with: .goingAway, reason: nil)
@@ -95,9 +107,18 @@ actor HAClient {
         pending.removeAll()
     }
 
+    /// Sends `{type: "ping"}` and awaits the matching pong. Used as a heartbeat
+    /// to detect silently-dropped sockets.
+    func ping() async throws {
+        _ = try await request(["type": "ping"])
+    }
+
     // MARK: - Requests
 
     /// Sends a request and awaits the matching response (`id` correlation).
+    /// Cancellation-aware: if the awaiting task is cancelled (e.g. heartbeat
+    /// timeout racing a ping), the pending continuation is resumed with
+    /// CancellationError so the caller's task group can unwind cleanly.
     @discardableResult
     func request(_ body: [String: Any]) async throws -> HAResult {
         guard let task, isConnected else { throw HAClientError.notConnected }
@@ -106,8 +127,18 @@ actor HAClient {
         var payload = body
         payload["id"] = id
         try await send(task: task, payload: payload)
-        return try await withCheckedThrowingContinuation { cont in
-            pending[id] = cont
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                pending[id] = cont
+            }
+        } onCancel: { [weak self] in
+            Task { await self?.cancelPending(id: id) }
+        }
+    }
+
+    private func cancelPending(id: Int) {
+        if let cont = pending.removeValue(forKey: id) {
+            cont.resume(throwing: CancellationError())
         }
     }
 
@@ -133,6 +164,46 @@ actor HAClient {
             areas.append(HAArea(areaID: id, name: name))
         }
         return areas
+    }
+
+    /// One row per entity in HA's entity registry: entity_id → (device_id,
+    /// entity-level area_id). Either may be nil. Entity-level area_id, when
+    /// present, overrides the device's area.
+    struct EntityRegistryEntry: Sendable {
+        let entityID: String
+        let deviceID: String?
+        let areaID: String?
+    }
+
+    func getEntityRegistry() async throws -> [EntityRegistryEntry] {
+        let result = try await request(["type": "config/entity_registry/list"])
+        guard case .array(let items) = result else { return [] }
+        var entries: [EntityRegistryEntry] = []
+        for item in items {
+            guard case .object(let obj) = item,
+                  case .string(let entityID) = obj["entity_id"] else { continue }
+            var deviceID: String? = nil
+            if case .string(let s) = obj["device_id"] { deviceID = s }
+            var areaID: String? = nil
+            if case .string(let s) = obj["area_id"] { areaID = s }
+            entries.append(EntityRegistryEntry(entityID: entityID, deviceID: deviceID, areaID: areaID))
+        }
+        return entries
+    }
+
+    /// Returns a map of device_id → area_id for every device in HA's device
+    /// registry. Used to resolve an entity's area when the entity itself
+    /// hasn't been individually assigned to an area.
+    func getDeviceAreaMap() async throws -> [String: String] {
+        let result = try await request(["type": "config/device_registry/list"])
+        guard case .array(let items) = result else { return [:] }
+        var map: [String: String] = [:]
+        for item in items {
+            guard case .object(let obj) = item,
+                  case .string(let id) = obj["id"] else { continue }
+            if case .string(let aid) = obj["area_id"] { map[id] = aid }
+        }
+        return map
     }
 
     func callService(domain: String, service: String, target: [String: Any]? = nil, data: [String: Any]? = nil) async throws {
@@ -207,7 +278,7 @@ actor HAClient {
 
     private func handle(message: [String: Any]) {
         let type = message["type"] as? String
-        if type == "result", let id = message["id"] as? Int {
+        if (type == "result" || type == "pong"), let id = message["id"] as? Int {
             guard let cont = pending.removeValue(forKey: id) else { return }
             let success = (message["success"] as? Bool) ?? true
             if success {
@@ -229,6 +300,9 @@ actor HAClient {
             cont.resume(throwing: error)
         }
         pending.removeAll()
+        if !intentionalDisconnect {
+            dropContinuation?.yield()
+        }
     }
 
     // MARK: - WebSocket helpers
