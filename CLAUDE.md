@@ -2,6 +2,40 @@
 
 - Do not add any Claude or Anthropic authorship references (Co-Authored-By, comments, documentation, commit messages, or otherwise) anywhere in this project.
 
+# Pending fix — phantom autofill popup hardening
+
+`Sources/HomeBar/Views/Components/FilterField.swift` is missing a
+structural fix that prevents phantom-popup regressions across all
+sheets, popovers, and new-window surfaces. Apply on the next change
+to this project — 9 lines, no behavior change for existing fields.
+
+In `NoAutoFillTextField` (alongside the existing `becomeFirstResponder`
+and `textDidBeginEditing` overrides) add:
+
+```swift
+override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    // Layer-5 install at the earliest moment a field's window is
+    // known. AppKit calls this synchronously when the view is
+    // attached to a window — before any focus event is possible —
+    // so our shared field-editor singleton is wired before
+    // becomeFirstResponder fires. Eliminates per-call-site
+    // DispatchQueue.main.async install races.
+    if let window {
+        installFieldEditorInterceptor(on: window)
+    }
+}
+```
+
+Then remove any per-call-site `DispatchQueue.main.async {
+installFieldEditorInterceptor(on: field.window) }` shims — the
+override makes them unnecessary and is guaranteed to beat any
+focus event.
+
+Reference implementation:
+`~/workspace/swift/stash-mac/Sources/StashMac/Views/Components/FilterField.swift`
+(canonical as of 2026-05-07).
+
 # Build & Test
 
 - Build: `swift build` or `make build` (release)
