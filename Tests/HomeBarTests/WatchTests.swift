@@ -11,9 +11,14 @@ import Testing
     #expect(!HomeBarStore.isWatchAlert(e))
 }
 
-@Test @MainActor func unavailableIsAlert() {
+@Test @MainActor func unavailableIsNotAlert() {
     let e = HAEntity(entityID: "sensor.probe", state: "unavailable", attributes: [:])
-    #expect(HomeBarStore.isWatchAlert(e))
+    #expect(!HomeBarStore.isWatchAlert(e))
+}
+
+@Test @MainActor func unknownIsNotAlert() {
+    let e = HAEntity(entityID: "sensor.probe", state: "unknown", attributes: [:])
+    #expect(!HomeBarStore.isWatchAlert(e))
 }
 
 @Test @MainActor func personHomeIsNotAlert() {
@@ -29,4 +34,19 @@ import Testing
 @Test @MainActor func coverOpenIsAlert() {
     let e = HAEntity(entityID: "cover.garage", state: "open", attributes: [:])
     #expect(HomeBarStore.isWatchAlert(e))
+}
+
+@Test @MainActor func enabledAutomationIsNotAlert() {
+    let e = HAEntity(entityID: "automation.door_open_a_while", state: "on", attributes: [:])
+    #expect(!HomeBarStore.isWatchAlert(e))
+}
+
+@Test @MainActor func disabledAutomationIsNotAlert() {
+    let e = HAEntity(entityID: "automation.door_open_a_while", state: "off", attributes: [:])
+    #expect(!HomeBarStore.isWatchAlert(e))
+}
+
+@Test @MainActor func runningScriptIsNotAlert() {
+    let e = HAEntity(entityID: "script.notify", state: "on", attributes: [:])
+    #expect(!HomeBarStore.isWatchAlert(e))
 }

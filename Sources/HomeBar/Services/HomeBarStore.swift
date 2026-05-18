@@ -892,11 +892,17 @@ final class HomeBarStore {
     /// alert. Covers the common passive states across domains.
     nonisolated private static let nominalStates: Set<String> = [
         "off", "closed", "locked", "home", "safe", "disarmed",
-        "docked", "stopped", "idle", "ok"
+        "docked", "stopped", "idle", "ok",
+        "unavailable", "unknown"
     ]
 
     nonisolated static func isWatchAlert(_ entity: HAEntity) -> Bool {
-        !nominalStates.contains(entity.state)
+        // For automations and scripts, `on`/`off` mean enabled/disabled (or
+        // running, in the script case) — not alarm conditions. Skip them.
+        if entity.domain == "automation" || entity.domain == "script" {
+            return false
+        }
+        return !nominalStates.contains(entity.state)
     }
 
     func isWatched(_ entityID: String) -> Bool {
@@ -922,6 +928,18 @@ final class HomeBarStore {
         return config.watchEntities.reduce(0) { count, id in
             if let e = byID[id], Self.isWatchAlert(e) { return count + 1 }
             return count
+        }
+    }
+
+    // MARK: HA updates
+
+    /// Count of `update.*` entities currently reporting an available update.
+    /// HA exposes one update entity per integration / add-on / core component
+    /// that can be upgraded; the state is "on" when an update is pending and
+    /// flips to "off" once installed.
+    var pendingUpdateCount: Int {
+        entities.reduce(0) { count, e in
+            (e.domain == "update" && e.state == "on") ? count + 1 : count
         }
     }
 

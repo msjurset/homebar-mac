@@ -148,6 +148,10 @@ final class AppController {
     private var navigationMonitor: Any?
     private var optionFlagMonitor: Any?
     private var hotkeyRef: EventHotKeyRef?
+    /// Small orange dot pinned to the top-right of the menu bar icon while
+    /// HA reports pending updates. Kept as a subview so the underlying
+    /// template image still adapts to light/dark menu bar appearance.
+    private var updateDotView: NSView?
 
     func setup() {
         MDIIcons.bootstrap()
@@ -211,14 +215,51 @@ final class AppController {
 
     private func updateStatusTint() {
         guard let button = statusItem?.button else { return }
-        let count = store.watchTriggeredCount
-        if count > 0 {
-            button.image = alertImage
-            button.toolTip = "HomeBar — \(count) alert\(count == 1 ? "" : "s")"
-        } else {
-            button.image = normalImage
-            button.toolTip = "HomeBar"
+        let alertCount = store.watchTriggeredCount
+        let updateCount = store.pendingUpdateCount
+
+        button.image = alertCount > 0 ? alertImage : normalImage
+
+        var parts: [String] = []
+        if alertCount > 0 {
+            parts.append("\(alertCount) alert\(alertCount == 1 ? "" : "s")")
         }
+        if updateCount > 0 {
+            parts.append("\(updateCount) update\(updateCount == 1 ? "" : "s") pending")
+        }
+        button.toolTip = parts.isEmpty ? "HomeBar" : "HomeBar — \(parts.joined(separator: ", "))"
+
+        updateUpdateDot(visible: updateCount > 0)
+    }
+
+    /// Pins / unpins a small orange dot to the top-right of the status bar
+    /// button. Used as a subview rather than a composited image so the
+    /// underlying template glyph keeps adapting to menu-bar appearance.
+    private func updateUpdateDot(visible: Bool) {
+        guard let button = statusItem?.button else { return }
+        if !visible {
+            updateDotView?.removeFromSuperview()
+            updateDotView = nil
+            return
+        }
+        let dotSize: CGFloat = 5
+        let pad: CGFloat = 2
+        let frame = NSRect(
+            x: button.bounds.width - dotSize - pad,
+            y: button.bounds.height - dotSize - pad,
+            width: dotSize, height: dotSize
+        )
+        if let dot = updateDotView {
+            dot.frame = frame
+            return
+        }
+        let dot = NSView(frame: frame)
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = NSColor.systemOrange.cgColor
+        dot.layer?.cornerRadius = dotSize / 2
+        dot.autoresizingMask = [.minXMargin, .minYMargin]
+        button.addSubview(dot)
+        updateDotView = dot
     }
 
     // MARK: Click handling
@@ -460,6 +501,17 @@ final class AppController {
 
     func closeSettings() {
         settingsWindow?.close()
+    }
+
+    /// Closes the popover and opens the Home Assistant Settings dashboard
+    /// in the default browser — the page where pending updates are listed.
+    func openHomeAssistantUpdates() {
+        if panel.isVisible { closePanel() }
+        let trimmed = store.config.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let cleaned = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+        guard let url = URL(string: cleaned + "/config/dashboard") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private var automationConfigWindow: NSWindow?

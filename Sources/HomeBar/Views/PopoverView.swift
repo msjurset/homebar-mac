@@ -93,8 +93,27 @@ struct PopoverView: View {
                 .font(.headline)
             Spacer()
             statusLabel
+            if store.pendingUpdateCount > 0 {
+                updateBadge
+            }
         }
         .padding(12)
+    }
+
+    private var updateBadge: some View {
+        let count = store.pendingUpdateCount
+        return Button(action: { AppController.shared.openHomeAssistantUpdates() }) {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 12))
+                Text("\(count)")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+            }
+            .foregroundStyle(Color.orange)
+        }
+        .buttonStyle(.plain)
+        .help("\(count) update\(count == 1 ? "" : "s") pending in Home Assistant — click to open")
     }
 
     @ViewBuilder
@@ -346,11 +365,11 @@ struct PopoverView: View {
         .onChange(of: query) { _, _ in
             store.searchFieldHasText = !query.isEmpty
             if isProgrammaticEdit { return }
-            recomputeSuggestions()
+            recomputeSuggestions(userInitiated: false)
         }
         .onChange(of: cursor) { _, _ in
             if isProgrammaticEdit { return }
-            recomputeSuggestions()
+            recomputeSuggestions(userInitiated: false)
         }
     }
 
@@ -405,7 +424,18 @@ struct PopoverView: View {
         dismissSuggestions()
     }
 
-    private func recomputeSuggestions() {
+    /// Recompute suggestions for the current cursor position.
+    ///
+    /// `userInitiated` distinguishes explicit requests (Tab, arrows, post-
+    /// commit chain into value completion) from passive triggers (typing, the
+    /// initial cursor sync on focus). Passive triggers must NOT auto-open key
+    /// completion — see the auto-pop discipline in CLAUDE.md. The key set is
+    /// tiny (`is:`, `domain:`, `area:`) and a dropdown that appears the moment
+    /// the popover opens just gets in the way of the common case (open with
+    /// ⌘/, hit a hotkey or click a tile). Value completion is allowed to
+    /// auto-open: once the user has committed a key, the dropdown is the
+    /// primary UI for picking from many candidates.
+    private func recomputeSuggestions(userInitiated: Bool = true) {
         // Use the text OUTSIDE the current word to gather already-used tokens
         // so the word being edited doesn't hide its own suggestions.
         let ns = query as NSString
@@ -440,6 +470,14 @@ struct PopoverView: View {
             alreadyUsedTokens: otherTokens
         )
         guard let result = SearchSuggestion.compute(ctx), !result.suggestions.isEmpty else {
+            dismissSuggestions()
+            return
+        }
+        // `addTrailingSpace` is the engine's signal that this is value
+        // completion; key completion never adds a trailing space. Suppress the
+        // passive auto-open for keys.
+        let isKeyCompletion = !result.addTrailingSpace
+        if !userInitiated && isKeyCompletion {
             dismissSuggestions()
             return
         }

@@ -32,9 +32,14 @@ A macOS menu bar app for fast Home Assistant control. Raycast-style popover — 
 
 **Alerts**
 - Right-click any tile → "Watch for Alerts" adds it to the watch set
-- Menu bar icon tints orange when any watched entity is in an off-nominal state (anything other than `off`, `closed`, `locked`, `home`, `safe`, `disarmed`, `docked`, `stopped`, `idle`, `ok`)
+- Menu bar icon tints orange when any watched entity is in an off-nominal state (anything other than `off`, `closed`, `locked`, `home`, `safe`, `disarmed`, `docked`, `stopped`, `idle`, `ok`, `unavailable`, `unknown`). `automation.*` and `script.*` entities are excluded — their `on`/`off` mean enabled / running, not an alarm condition.
 - Watched tiles get a small eye badge; it goes orange when that tile is the one alerting
 - Subscribes to HA's `persistent_notifications_updated` → delivers native macOS banners with a Dismiss action that routes back to `persistent_notification.dismiss`
+
+**HA Updates**
+- When any `update.*` entity reports state `on`, an orange `↑ N` badge appears in the popover header (right of the connection label) and a small orange dot is overlaid on the menu bar icon
+- Clicking the badge closes the popover and opens `<your-HA-base-URL>/config/dashboard` in your default browser
+- Badge clears automatically on the next `state_changed` / reconcile tick once the update is installed
 
 **Auth**
 - Direct long-lived access token (stored at `~/.homebar/token`, 0600), or
