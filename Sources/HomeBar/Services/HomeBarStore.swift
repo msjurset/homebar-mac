@@ -61,6 +61,16 @@ final class HomeBarStore {
     /// global escape monitor defer to the search field's own clear-on-escape
     /// handler instead of closing the panel.
     var searchFieldHasText: Bool = false
+    /// When true, audible `homebar_speak` events are re-routed to a macOS
+    /// banner instead of being played through the speech synthesizer or
+    /// audio player. Persisted in UserDefaults so the toggle survives
+    /// relaunch. HA persistent notifications are unaffected.
+    var silenced: Bool = UserDefaults.standard.bool(forKey: HomeBarStore.silencedKey) {
+        didSet {
+            UserDefaults.standard.set(silenced, forKey: Self.silencedKey)
+        }
+    }
+    private static let silencedKey = "homebar.silenced"
     /// Maps automation entity_id (e.g. "automation.office_toggle") to the list
     /// of entities referenced in its config. Populated asynchronously after
     /// connect; used to render aggregate tile color for automations.
@@ -484,6 +494,18 @@ final class HomeBarStore {
 
         var volume: Float = 1.0
         if case .number(let v) = data["volume"] { volume = Float(v) }
+
+        // Silenced mode re-routes audible speaks to a macOS banner. A
+        // media_url-only event with no message is dropped — a "HomeBar
+        // suppressed audio from <url>" banner would be more noise than
+        // signal.
+        if silenced {
+            if case .string(let message) = data["message"], !message.isEmpty {
+                NotificationService.shared.showSpeak(title: "HomeBar", message: message)
+            }
+            return
+        }
+
         if case .string(let media) = data["media_url"], !media.isEmpty,
            let url = URL(string: media) {
             MediaPlayerService.shared.play(url, volume: volume)

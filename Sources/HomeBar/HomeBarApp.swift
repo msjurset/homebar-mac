@@ -152,6 +152,10 @@ final class AppController {
     /// HA reports pending updates. Kept as a subview so the underlying
     /// template image still adapts to light/dark menu bar appearance.
     private var updateDotView: NSView?
+    /// Tiny bell-slash glyph pinned to the bottom-left of the menu bar
+    /// icon while audible speak events are silenced. Same template-friendly
+    /// subview approach as `updateDotView`.
+    private var silenceBadgeView: NSImageView?
 
     func setup() {
         MDIIcons.bootstrap()
@@ -217,6 +221,7 @@ final class AppController {
         guard let button = statusItem?.button else { return }
         let alertCount = store.watchTriggeredCount
         let updateCount = store.pendingUpdateCount
+        let silenced = store.silenced
 
         button.image = alertCount > 0 ? alertImage : normalImage
 
@@ -227,9 +232,13 @@ final class AppController {
         if updateCount > 0 {
             parts.append("\(updateCount) update\(updateCount == 1 ? "" : "s") pending")
         }
+        if silenced {
+            parts.append("speak silenced")
+        }
         button.toolTip = parts.isEmpty ? "HomeBar" : "HomeBar — \(parts.joined(separator: ", "))"
 
         updateUpdateDot(visible: updateCount > 0)
+        updateSilenceBadge(visible: silenced)
     }
 
     /// Pins / unpins a small orange dot to the top-right of the status bar
@@ -260,6 +269,34 @@ final class AppController {
         dot.autoresizingMask = [.minXMargin, .minYMargin]
         button.addSubview(dot)
         updateDotView = dot
+    }
+
+    /// Pins / unpins a small bell-slash glyph to the bottom-left of the
+    /// status bar button while speaks are silenced. Positioned opposite the
+    /// update dot so the two never overlap.
+    private func updateSilenceBadge(visible: Bool) {
+        guard let button = statusItem?.button else { return }
+        if !visible {
+            silenceBadgeView?.removeFromSuperview()
+            silenceBadgeView = nil
+            return
+        }
+        let size: CGFloat = 8
+        let pad: CGFloat = 1
+        let frame = NSRect(x: pad, y: pad, width: size, height: size)
+        if let badge = silenceBadgeView {
+            badge.frame = frame
+            return
+        }
+        let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .bold)
+        let img = NSImage(systemSymbolName: "bell.slash.fill", accessibilityDescription: "Silenced")?
+            .withSymbolConfiguration(cfg)
+        let view = NSImageView(frame: frame)
+        view.image = img
+        view.contentTintColor = NSColor.systemOrange
+        view.autoresizingMask = [.maxXMargin, .maxYMargin]
+        button.addSubview(view)
+        silenceBadgeView = view
     }
 
     // MARK: Click handling

@@ -41,6 +41,12 @@ A macOS menu bar app for fast Home Assistant control. Raycast-style popover — 
 - Clicking the badge closes the popover and opens `<your-HA-base-URL>/config/dashboard` in your default browser
 - Badge clears automatically on the next `state_changed` / reconcile tick once the update is installed
 
+**Silence speak events**
+- Bell button in the popover header (left of the connection label) toggles audible speak playback on / off; state persists across launches
+- When silenced, incoming `homebar_speak` events with a `message:` arrive as macOS notification banners instead of playing through the speech synthesizer or audio player. Events with only `media_url:` and no message are dropped (a "HomeBar suppressed audio" banner would be more noise than signal)
+- HA `persistent_notifications_updated` banners are unaffected by this toggle — they always show
+- Menu bar icon gets a tiny bell-slash glyph in the corner while silenced
+
 **Auth**
 - Direct long-lived access token (stored at `~/.homebar/token`, 0600), or
 - 1Password reference — paste an `op://vault/item/field` into the token field; resolved via `op read` on every connect (Touch ID when 1Password CLI integration is enabled)

@@ -66,6 +66,26 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Shows a macOS banner re-routed from a silenced `homebar_speak` event.
+    /// Doesn't attach a category — there's no HA-side notification to dismiss.
+    func showSpeak(title: String, message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title.isEmpty ? "HomeBar" : title
+        content.body = message
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "homebar-speak-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { err in
+            if let err {
+                fputs("UN add failed: \(err.localizedDescription)\n", stderr)
+            }
+        }
+    }
+
     // MARK: UNUserNotificationCenterDelegate
 
     nonisolated func userNotificationCenter(

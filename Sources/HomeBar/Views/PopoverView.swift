@@ -92,12 +92,26 @@ struct PopoverView: View {
             Text("HomeBar")
                 .font(.headline)
             Spacer()
+            silenceToggle
             statusLabel
             if store.pendingUpdateCount > 0 {
                 updateBadge
             }
         }
         .padding(12)
+    }
+
+    private var silenceToggle: some View {
+        Button(action: { store.silenced.toggle() }) {
+            Image(systemName: store.silenced ? "bell.slash.fill" : "bell.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(store.silenced ? Color.orange : Color.secondary)
+                .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.plain)
+        .help(store.silenced
+            ? "Speak events silenced — audible HA messages arrive as banners. Click to unmute."
+            : "Speak events play audibly on this Mac. Click to silence (banners only).")
     }
 
     private var updateBadge: some View {
