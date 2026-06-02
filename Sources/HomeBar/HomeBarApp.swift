@@ -161,6 +161,7 @@ final class AppController {
         MDIIcons.bootstrap()
         NotificationService.shared.bootstrap()
         _ = UpdaterService.shared
+        _ = installFieldEditorInterceptorsForAllWindows()
         setupStatusItem()
         panel = FloatingPanel(contentView: PopoverView().environment(store))
         registerHotkey()
@@ -466,6 +467,10 @@ final class AppController {
 
         menu.addItem(NSMenuItem.separator())
 
+        let restartItem = NSMenuItem(title: "Restart", action: #selector(restart), keyEquivalent: "")
+        restartItem.target = self
+        menu.addItem(restartItem)
+
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -507,6 +512,17 @@ final class AppController {
 
     @objc private func checkForUpdates() {
         UpdaterService.shared.checkForUpdates()
+    }
+
+    @objc private func restart() {
+        let path = Bundle.main.bundlePath
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let script = "while kill -0 \(pid) 2>/dev/null; do sleep 0.1; done; open \"\(path)\""
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", script]
+        task.launch()
+        NSApp.terminate(nil)
     }
 
     @objc private func quit() {

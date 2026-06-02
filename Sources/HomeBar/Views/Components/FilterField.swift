@@ -1,44 +1,97 @@
 import AppKit
 import SwiftUI
 
+extension NSTextView {
+    /// Disables AppKit's autofill/autocomplete popup and every other
+    /// "helpful" automatic text feature. All eight legacy auto-* flags
+    /// must be disabled, plus the macOS 14 inline-prediction trait and
+    /// the macOS 15 Writing Tools traits.
+    func disableAutoFeatures() {
+        self.isAutomaticTextCompletionEnabled = false
+        self.isAutomaticSpellingCorrectionEnabled = false
+        self.isAutomaticTextReplacementEnabled = false
+        self.isContinuousSpellCheckingEnabled = false
+        self.isAutomaticQuoteSubstitutionEnabled = false
+        self.isAutomaticDashSubstitutionEnabled = false
+        self.isAutomaticDataDetectionEnabled = false
+        self.isAutomaticLinkDetectionEnabled = false
+        // macOS 14+ added an inline-prediction bar that renders as a
+        // large ghost popup beneath the field on focus. The auto-* flags
+        // above don't suppress it; this trait does.
+        if #available(macOS 14.0, *) {
+            self.inlinePredictionType = .no
+        }
+        // macOS 15 routes predictive text through Apple Intelligence
+        // Writing Tools — the popup reappears here unless we explicitly
+        // opt out at the per-editor level.
+        if #available(macOS 15.0, *) {
+            self.writingToolsBehavior = .none
+            self.allowedWritingToolsResultOptions = []
+        }
+    }
+}
+
 /// NSTextField subclass that disables every macOS auto-* behavior on its field
 /// editor (the shared NSTextView). Required because SwiftUI's `TextField` on
 /// macOS shows a system autofill popover that no SwiftUI modifier can disable,
 /// and our custom suggestion dropdown needs to own that UI slot.
 final class NoAutoFillTextField: NSTextField {
+    /// Force the cell to be our subclass so the cell-level
+    /// `setUpFieldEditorAttributes` override gets installed. Without this
+    /// override AppKit hands the field its default `NSTextFieldCell` and
+    /// the popup appears on the first focus per session before any of the
+    /// instance-level lifecycle hooks fire.
+    override class var cellClass: AnyClass? {
+        get { NoAutoFillTextFieldCell.self }
+        set {}
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Layer-5 install at the earliest moment a field's window is
+        // known. AppKit calls this synchronously when the view is
+        // attached to a window — before any focus event is possible —
+        // so our shared field-editor singleton is wired before
+        // becomeFirstResponder fires. Eliminates per-call-site
+        // DispatchQueue.main.async install races.
+        if let window {
+            installFieldEditorInterceptor(on: window)
+        }
+    }
+
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
-        if ok { disableAutoFeatures() }
+        if ok {
+            (currentEditor() as? NSTextView)?.disableAutoFeatures()
+        }
         return ok
     }
 
     override func textDidBeginEditing(_ notification: Notification) {
         super.textDidBeginEditing(notification)
-        disableAutoFeatures()
+        (notification.object as? NSTextView)?.disableAutoFeatures()
     }
 
     override func textShouldBeginEditing(_ textObject: NSText) -> Bool {
         let ok = super.textShouldBeginEditing(textObject)
-        disableAutoFeatures()
+        (textObject as? NSTextView)?.disableAutoFeatures()
         return ok
     }
+}
 
-    private func disableAutoFeatures() {
-        guard let editor = currentEditor() as? NSTextView else { return }
-        editor.isAutomaticTextCompletionEnabled = false
-        editor.isAutomaticSpellingCorrectionEnabled = false
-        editor.isAutomaticTextReplacementEnabled = false
-        editor.isContinuousSpellCheckingEnabled = false
-        editor.isAutomaticQuoteSubstitutionEnabled = false
-        editor.isAutomaticDashSubstitutionEnabled = false
-        editor.isAutomaticDataDetectionEnabled = false
-        editor.isAutomaticLinkDetectionEnabled = false
-        // macOS 14+ added an inline-prediction bar that renders as a
-        // large ghost popup beneath the field on focus. The auto-* flags
-        // above don't suppress it; this trait does.
-        if #available(macOS 14.0, *) {
-            editor.inlinePredictionType = .no
-        }
+/// Cell that disables predictions on the field editor *before* it begins
+/// taking input. The instance-level lifecycle hooks (`becomeFirstResponder`,
+/// `textDidBeginEditing`, etc.) fire AFTER `super.becomeFirstResponder()`,
+/// but on Sequoia the inline-prediction popup is scheduled inside that
+/// super call — by the time the hooks run, the popup has already been laid
+/// out once. `setUpFieldEditorAttributes` runs earlier, before AppKit
+/// attaches the editor for input, which is the only point that suppresses
+/// the popup on first focus per session.
+final class NoAutoFillTextFieldCell: NSTextFieldCell {
+    override func setUpFieldEditorAttributes(_ textObj: NSText) -> NSText {
+        let configured = super.setUpFieldEditorAttributes(textObj)
+        (configured as? NSTextView)?.disableAutoFeatures()
+        return configured
     }
 }
 
