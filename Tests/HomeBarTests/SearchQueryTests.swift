@@ -20,13 +20,15 @@ private func matches(
     _ input: String,
     _ e: HAEntity,
     areas: [String: String] = [:],
-    watchedIDs: Set<String> = []
+    watchedIDs: Set<String> = [],
+    categories: [String: String] = [:]
 ) -> Bool {
     let q = SearchQuery.parse(input)
     return q.matches(
         e,
         areaName: { areas[$0] },
-        isWatched: { watchedIDs.contains($0) }
+        isWatched: { watchedIDs.contains($0) },
+        entityCategory: { categories[$0] }
     )
 }
 
@@ -132,6 +134,45 @@ private func matches(
     #expect(!matches("domain:light kitchen", sw))
 }
 
+@Test @MainActor func isConfigAndDiagnosticMatch() {
+    let cfg = entity("number.center_light_on_level", state: "254")
+    let diag = entity("update.center_light_firmware", state: "off")
+    let normal = entity("light.center_light", state: "on")
+    let cats = [
+        "number.center_light_on_level": "config",
+        "update.center_light_firmware": "diagnostic"
+    ]
+    #expect(matches("is:config", cfg, categories: cats))
+    #expect(!matches("is:config", diag, categories: cats))
+    #expect(!matches("is:config", normal, categories: cats))
+
+    #expect(matches("is:diagnostic", diag, categories: cats))
+    #expect(!matches("is:diagnostic", cfg, categories: cats))
+    #expect(!matches("is:diagnostic", normal, categories: cats))
+}
+
+@Test func explicitlyRequestsConfigOrDiagnostic() {
+    #expect(SearchQuery.parse("is:config").explicitlyRequestsConfigOrDiagnostic)
+    #expect(SearchQuery.parse("is:diagnostic").explicitlyRequestsConfigOrDiagnostic)
+    #expect(SearchQuery.parse("is:config center").explicitlyRequestsConfigOrDiagnostic)
+    #expect(!SearchQuery.parse("center").explicitlyRequestsConfigOrDiagnostic)
+    #expect(!SearchQuery.parse("is:on center").explicitlyRequestsConfigOrDiagnostic)
+}
+
+@Test @MainActor func storeConfigAndDiagnosticDetection() {
+    let store = HomeBarStore()
+    store.entityCategories = [
+        "number.center_light_on_level": "config",
+        "update.center_light_firmware": "diagnostic"
+    ]
+    store.hiddenEntityIDs = ["sensor.internal_temperature"]
+
+    #expect(store.isConfigOrDiagnostic("number.center_light_on_level"))
+    #expect(store.isConfigOrDiagnostic("update.center_light_firmware"))
+    #expect(store.isConfigOrDiagnostic("sensor.internal_temperature"))
+    #expect(!store.isConfigOrDiagnostic("light.center_light"))
+}
+
 // MARK: - Suggestion engine
 
 @Test func suggestKeysWhenBareWord() {
@@ -168,7 +209,7 @@ private func matches(
         alreadyUsedTokens: []
     )
     let r = SearchSuggestion.compute(ctx)
-    #expect(r?.suggestions == ["is:watched", "is:alerting", "is:on", "is:off"])
+    #expect(r?.suggestions == ["is:watched", "is:alerting", "is:on", "is:off", "is:config", "is:diagnostic"])
     #expect(r?.addTrailingSpace == true)
 }
 
@@ -193,7 +234,7 @@ private func matches(
         alreadyUsedTokens: [.isFacet(.watched)]
     )
     let r = SearchSuggestion.compute(ctx)
-    #expect(r?.suggestions == ["is:alerting", "is:on", "is:off"])
+    #expect(r?.suggestions == ["is:alerting", "is:on", "is:off", "is:config", "is:diagnostic"])
 }
 
 @Test func suggestDomainValuesFromContext() {

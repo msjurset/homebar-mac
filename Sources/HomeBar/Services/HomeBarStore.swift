@@ -33,6 +33,14 @@ final class HomeBarStore {
     /// device (or the entity-registry override) rather than in the entity's
     /// state attributes. Populated on connect and refreshed by reconcile.
     var entityAreaIDs: [String: String] = [:]
+    /// Resolved entity_id → entity_category mapping ("config", "diagnostic", etc.).
+    /// Populated from HA entity registry on connect and refreshed by reconcile.
+    var entityCategories: [String: String] = [:]
+    /// Set of entity_ids hidden in HA (hidden_by != nil).
+    var hiddenEntityIDs: Set<String> = []
+    /// When true, search results include all entity categories (config & diagnostic).
+    /// Can be toggled via the hidden Option-key reveal checkbox.
+    var includeAllCategories: Bool = false
     var pinnedIDs: [String] = []
     var aliases: [String: String] = [:]
     var recents: [String] = []
@@ -80,6 +88,7 @@ final class HomeBarStore {
     var automationOverrides: [String: [String]] = [:]
 
     private var hasLoaded = false
+    private var cached1PasswordToken: String?
     private var eventTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var dropWatchTask: Task<Void, Never>?
@@ -120,6 +129,22 @@ final class HomeBarStore {
         return entityAreaIDs[entity.entityID]
     }
 
+    /// True if the entity is categorized as config or diagnostic, or marked hidden in HA.
+    func isConfigOrDiagnostic(_ entityID: String) -> Bool {
+        if let cat = entityCategories[entityID]?.lowercased(),
+           cat == "config" || cat == "diagnostic" {
+            return true
+        }
+        if hiddenEntityIDs.contains(entityID) {
+            return true
+        }
+        return false
+    }
+
+    func entityCategory(_ entityID: String) -> String? {
+        entityCategories[entityID]
+    }
+
     func bootstrap() async {
         guard !hasLoaded else { return }
         hasLoaded = true
@@ -136,6 +161,7 @@ final class HomeBarStore {
 
     func saveConfig(_ new: HAConfig) async {
         config = new
+        cached1PasswordToken = nil
         try? await persistence.saveConfig(new)
     }
 
@@ -178,11 +204,16 @@ final class HomeBarStore {
 
         let token: String
         if let ref = config.tokenRef, !ref.isEmpty {
-            do {
-                token = try await OnePassword.resolve(ref)
-            } catch {
-                status = .failed("1Password: \(error.localizedDescription)")
-                return
+            if let cached = cached1PasswordToken {
+                token = cached
+            } else {
+                do {
+                    token = try await OnePassword.resolve(ref)
+                    cached1PasswordToken = token
+                } catch {
+                    status = .failed("1Password: \(error.localizedDescription)")
+                    return
+                }
             }
         } else if let t = Keychain.getToken() {
             token = t
@@ -195,11 +226,13 @@ final class HomeBarStore {
             try await client.connect(websocketURL: wsURL, token: token)
             let loaded = try await client.getStates()
             let loadedAreas = (try? await client.getAreas()) ?? []
-            let loadedEntityAreas = await Self.loadEntityAreaMap(client: client)
+            let regSnapshot = await Self.loadRegistrySnapshot(client: client)
             entities = loaded.sorted { $0.friendlyName.localizedCaseInsensitiveCompare($1.friendlyName) == .orderedAscending }
             rebuildEntityIndex()
             areas = loadedAreas
-            entityAreaIDs = loadedEntityAreas
+            entityAreaIDs = regSnapshot.entityAreaIDs
+            entityCategories = regSnapshot.entityCategories
+            hiddenEntityIDs = regSnapshot.hiddenEntityIDs
             status = .connected
             reconnectAttempt = 0
             try await client.subscribeStateChanges()
@@ -236,24 +269,47 @@ final class HomeBarStore {
         reconnectAttempt = 0
     }
 
-    /// Builds the entity_id → area_id map by combining the entity registry
-    /// (which has entity-level area override and a device link) with the
-    /// device registry (which has the device's area). Entity-level area
-    /// wins; otherwise falls back to the device's area.
-    private static func loadEntityAreaMap(client: HAClient) async -> [String: String] {
+    struct RegistrySnapshot: Sendable {
+        let entityAreaIDs: [String: String]
+        let entityCategories: [String: String]
+        let hiddenEntityIDs: Set<String>
+    }
+
+    /// Fetches HA's entity and device registries to resolve:
+    /// 1. entity_id → area_id (entity override wins over device area)
+    /// 2. entity_id → entity_category ("config", "diagnostic", etc.)
+    /// 3. hidden entities (hidden_by != nil)
+    private static func loadRegistrySnapshot(client: HAClient) async -> RegistrySnapshot {
         async let entityRegTask: [HAClient.EntityRegistryEntry] = (try? await client.getEntityRegistry()) ?? []
         async let deviceMapTask: [String: String] = (try? await client.getDeviceAreaMap()) ?? [:]
         let entityReg = await entityRegTask
         let deviceMap = await deviceMapTask
-        var resolved: [String: String] = [:]
+        var resolvedAreas: [String: String] = [:]
+        var categories: [String: String] = [:]
+        var hidden: Set<String> = []
         for entry in entityReg {
             if let aid = entry.areaID {
-                resolved[entry.entityID] = aid
+                resolvedAreas[entry.entityID] = aid
             } else if let did = entry.deviceID, let dAid = deviceMap[did] {
-                resolved[entry.entityID] = dAid
+                resolvedAreas[entry.entityID] = dAid
+            }
+            if let cat = entry.entityCategory {
+                categories[entry.entityID] = cat
+            }
+            if entry.hiddenBy != nil {
+                hidden.insert(entry.entityID)
             }
         }
-        return resolved
+        return RegistrySnapshot(
+            entityAreaIDs: resolvedAreas,
+            entityCategories: categories,
+            hiddenEntityIDs: hidden
+        )
+    }
+
+    private static func loadEntityAreaMap(client: HAClient) async -> [String: String] {
+        let snapshot = await loadRegistrySnapshot(client: client)
+        return snapshot.entityAreaIDs
     }
 
     // MARK: Reconnect / heartbeat
@@ -330,13 +386,15 @@ final class HomeBarStore {
             if let freshAreas = try? await client.getAreas(), !freshAreas.isEmpty {
                 areas = freshAreas
             }
-            // Same idea for the entity-area resolver — refresh on every
-            // reconcile so newly-assigned areas in HA become filterable
+            // Same idea for the entity-area resolver and categories — refresh on every
+            // reconcile so newly-assigned areas and categories in HA become filterable
             // without forcing a reconnect here.
-            let freshMap = await Self.loadEntityAreaMap(client: client)
-            if !freshMap.isEmpty {
-                entityAreaIDs = freshMap
+            let freshSnapshot = await Self.loadRegistrySnapshot(client: client)
+            if !freshSnapshot.entityAreaIDs.isEmpty {
+                entityAreaIDs = freshSnapshot.entityAreaIDs
             }
+            entityCategories = freshSnapshot.entityCategories
+            hiddenEntityIDs = freshSnapshot.hiddenEntityIDs
         } catch {
             await handleUnexpectedDisconnect()
         }

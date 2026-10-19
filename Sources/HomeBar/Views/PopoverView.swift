@@ -71,6 +71,12 @@ struct PopoverView: View {
         }
         .onChange(of: gridMode) { _, _ in refreshDisplayed() }
         .onChange(of: recencyLimit) { _, _ in refreshDisplayed() }
+        .onChange(of: store.optionHeld) { _, _ in
+            if !query.isEmpty { refreshDisplayed() }
+        }
+        .onChange(of: store.includeAllCategories) { _, _ in
+            if !query.isEmpty { refreshDisplayed() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .homebarPanelDidOpen)) { _ in
             recencyLimit = HomeBarStore.initialRecencyDisplay
             focusSoon()
@@ -371,7 +377,11 @@ struct PopoverView: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .focusable(false)
                 .help("Clear search")
+            }
+            if store.optionHeld || store.includeAllCategories {
+                allCategoriesToggle
             }
         }
         .padding(.horizontal, 12)
@@ -436,6 +446,35 @@ struct PopoverView: View {
         query = ""
         pendingCursor = 0
         dismissSuggestions()
+    }
+
+    private var allCategoriesToggle: some View {
+        let isChecked = store.includeAllCategories
+        return Button(action: {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                store.includeAllCategories.toggle()
+            }
+        }) {
+            HStack(spacing: 4) {
+                Image(systemName: isChecked ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(isChecked ? Color.accentColor : Color.secondary)
+                Text("All categories")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(isChecked ? Color.primary.opacity(0.9) : Color.secondary)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(isChecked ? Color.accentColor.opacity(0.14) : Color.white.opacity(0.06))
+            )
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .help(isChecked
+            ? "Searching all categories (config & diagnostic included). Click to hide."
+            : "Search all entity categories (including config & diagnostic)")
     }
 
     /// Recompute suggestions for the current cursor position.
@@ -924,12 +963,17 @@ struct PopoverView: View {
         let parsed = SearchQuery.parse(query)
         guard !parsed.isEmpty else { return [] }
         let areaNameLookup: [String: String] = store.areaName
+        let showAll = store.includeAllCategories || parsed.explicitlyRequestsConfigOrDiagnostic
         return store.entities.filter { e in
-            parsed.matches(
+            if !showAll && store.isConfigOrDiagnostic(e.entityID) && !store.isPinned(e.entityID) {
+                return false
+            }
+            return parsed.matches(
                 e,
                 areaName: { areaNameLookup[$0] },
                 areaID: { store.resolvedAreaID(for: $0) },
-                isWatched: { store.isWatched($0) }
+                isWatched: { store.isWatched($0) },
+                entityCategory: { store.entityCategory($0) }
             )
         }
     }

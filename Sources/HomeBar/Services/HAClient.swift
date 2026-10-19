@@ -167,12 +167,14 @@ actor HAClient {
     }
 
     /// One row per entity in HA's entity registry: entity_id → (device_id,
-    /// entity-level area_id). Either may be nil. Entity-level area_id, when
-    /// present, overrides the device's area.
+    /// entity-level area_id, entity_category, hidden_by). Either may be nil.
+    /// Entity-level area_id, when present, overrides the device's area.
     struct EntityRegistryEntry: Sendable {
         let entityID: String
         let deviceID: String?
         let areaID: String?
+        let entityCategory: String?
+        let hiddenBy: String?
     }
 
     func getEntityRegistry() async throws -> [EntityRegistryEntry] {
@@ -186,7 +188,17 @@ actor HAClient {
             if case .string(let s) = obj["device_id"] { deviceID = s }
             var areaID: String? = nil
             if case .string(let s) = obj["area_id"] { areaID = s }
-            entries.append(EntityRegistryEntry(entityID: entityID, deviceID: deviceID, areaID: areaID))
+            var entityCategory: String? = nil
+            if case .string(let s) = obj["entity_category"] { entityCategory = s }
+            var hiddenBy: String? = nil
+            if case .string(let s) = obj["hidden_by"] { hiddenBy = s }
+            entries.append(EntityRegistryEntry(
+                entityID: entityID,
+                deviceID: deviceID,
+                areaID: areaID,
+                entityCategory: entityCategory,
+                hiddenBy: hiddenBy
+            ))
         }
         return entries
     }

@@ -6,10 +6,16 @@ APP_NAME="HomeBar"
 BUNDLE="${APP_NAME}.app"
 DMG="${APP_NAME}-${VERSION}.dmg"
 SIGN_TOOL=".build/artifacts/sparkle/Sparkle/bin/sign_update"
-SIGN_IDENTITY="Developer ID Application: Mark Sjurseth (RR3C36U9G4)"
-NOTARY_PROFILE="notarytool-profile"
-REPO="msjurset/homebar-mac"
+SIGN_IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application:' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-notarytool-profile}"
+REPO="${GITHUB_REPO:-$(git remote get-url origin 2>/dev/null | sed -E 's/.*[:\/]([^\/]+\/[^\/\.]+)(\.git)?$/\1/')}"
 BUILD_NUM=$(git rev-list --count HEAD 2>/dev/null || echo "1")
+
+if [ -z "${SIGN_IDENTITY}" ]; then
+    echo "Error: No Developer ID Application certificate found in Keychain."
+    echo "Specify manually via: export SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)'"
+    exit 1
+fi
 
 echo "==> Building ${APP_NAME} v${VERSION} (build ${BUILD_NUM})..."
 

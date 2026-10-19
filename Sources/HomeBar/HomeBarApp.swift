@@ -74,6 +74,13 @@ private func homebarHotkeyCallback(
         nil, MemoryLayout<EventHotKeyID>.size, nil, &hotkeyID
     )
     if hotkeyID.id == 1 {
+        // Yield cmd-/ to other heavy-search workspace apps if they have focus
+        if let front = NSWorkspace.shared.frontmostApplication,
+           let bundleID = front.bundleIdentifier,
+           ["com.msjurset.recruit-mac", "com.msjurset.stash-mac"].contains(bundleID) {
+            return OSStatus(eventNotHandledErr)
+        }
+        
         DispatchQueue.main.async {
             AppController.shared.togglePanel()
         }
@@ -432,6 +439,7 @@ final class AppController {
         if let m = navigationMonitor { NSEvent.removeMonitor(m); navigationMonitor = nil }
         if let m = optionFlagMonitor { NSEvent.removeMonitor(m); optionFlagMonitor = nil }
         store.optionHeld = false
+        store.includeAllCategories = false
     }
 
     // MARK: Context menu

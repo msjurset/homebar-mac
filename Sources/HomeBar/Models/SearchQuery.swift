@@ -14,6 +14,8 @@ struct SearchQuery: Equatable {
         case alerting
         case on
         case off
+        case config
+        case diagnostic
     }
 
     enum Token: Equatable {
@@ -28,6 +30,16 @@ struct SearchQuery: Equatable {
     static let empty = SearchQuery(tokens: [], freeText: [])
 
     var isEmpty: Bool { tokens.isEmpty && freeText.isEmpty }
+
+    /// True if the query explicitly requested config or diagnostic entities via is:config or is:diagnostic.
+    var explicitlyRequestsConfigOrDiagnostic: Bool {
+        tokens.contains { token in
+            if case .isFacet(let f) = token {
+                return f == .config || f == .diagnostic
+            }
+            return false
+        }
+    }
 
     static func parse(_ input: String) -> SearchQuery {
         let parts = input.split(whereSeparator: { $0.isWhitespace }).map(String.init)
@@ -72,7 +84,8 @@ struct SearchQuery: Equatable {
         _ entity: HAEntity,
         areaName: (String) -> String?,
         areaID: (HAEntity) -> String? = { $0.areaID },
-        isWatched: (String) -> Bool
+        isWatched: (String) -> Bool,
+        entityCategory: (String) -> String? = { _ in nil }
     ) -> Bool {
         for token in tokens {
             switch token {
@@ -85,6 +98,10 @@ struct SearchQuery: Equatable {
                 guard Self.entityIsOn(entity) else { return false }
             case .isFacet(.off):
                 guard !Self.entityIsOn(entity) else { return false }
+            case .isFacet(.config):
+                guard entityCategory(entity.entityID)?.lowercased() == "config" else { return false }
+            case .isFacet(.diagnostic):
+                guard entityCategory(entity.entityID)?.lowercased() == "diagnostic" else { return false }
             case .domain(let d):
                 guard entity.domain.lowercased() == d else { return false }
             case .area(let a):

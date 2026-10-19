@@ -166,7 +166,7 @@ Sparkle's EdDSA key, regenerates `appcast.xml`, commits, tags `vX.Y.Z`,
 pushes, and creates a GitHub release with the DMG attached.
 
 **One-time setup:**
-- Developer ID cert (`Developer ID Application: Mark Sjurseth (...)`) in the
+- Developer ID cert (`Developer ID Application: <Your Name> (<TEAMID>)`) in the
   login keychain
 - `xcrun notarytool store-credentials notarytool-profile` (uses an Apple ID
   + app-specific password)
